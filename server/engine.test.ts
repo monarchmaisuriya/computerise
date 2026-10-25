@@ -61,6 +61,8 @@ function fakeMac(
       case "compose":
         await writeFile(input.out, "composed-jpeg");
         return JSON.stringify({ written: true });
+      case "promptAccessibility":
+        return JSON.stringify({ trusted: options.trusted ?? true });
       default:
         throw new Error(`fakeMac has no answer for ${scriptName(args)}`);
     }
@@ -249,6 +251,35 @@ describe("capturing the screen", () => {
     });
     await expect(denied.screenshot()).rejects.toThrow("Paseo needs Screen Recording");
     expect(denied.screenRecording()).toBe("missing");
+  });
+
+  it("checks Screen Recording with a one-point capture of the menu bar corner, deleting it, and reports missing without throwing", async () => {
+    const mac = fakeMac();
+    const engine = engineOn(mac);
+    expect(await engine.checkScreenRecording()).toBe("granted");
+    const capture = mac.calls.find((call) => call.file === "screencapture")!;
+    expect(capture.args).toEqual(["-x", "-R", "0,0,1,1", "-t", "jpg", capture.args[5]]);
+    expect(existsSync(capture.args[5])).toBe(false);
+    const denied = new MacEngine({
+      run: async (file, args, timeoutMs) => {
+        if (file === "screencapture") throw Object.assign(new Error("failed"), { stderr: "could not create image from display" });
+        return mac.run(file, args, timeoutMs);
+      },
+      scratchDir: tempDir("computerise-deny-"),
+    });
+    expect(await denied.checkScreenRecording()).toBe("missing");
+  });
+
+  it("opens only the fixed System Settings panes and asks macOS for the Accessibility prompt", async () => {
+    const mac = fakeMac({ trusted: false });
+    const engine = engineOn(mac);
+    await engine.openPrivacySettings("accessibility");
+    await engine.openPrivacySettings("screen-recording");
+    expect(mac.calls.filter((call) => call.file === "open").map((call) => call.args)).toEqual([
+      ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+      ["x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"],
+    ]);
+    expect(await engine.promptAccessibility()).toBe(false);
   });
 
   it("names the Screen Recording permission when macOS refuses the capture", async () => {

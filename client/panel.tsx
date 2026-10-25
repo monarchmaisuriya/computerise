@@ -1,7 +1,7 @@
 import { type PluginWorkspacePanelProps, usePaseo, useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Image, Pressable, ScrollView, Text, View } from "react-native";
-import { answerApprovalRpc, type ApprovalScope, panelHealthRpc, panelScreenshotRpc, panelStatusRpc, type ScreenRecording, setModeRpc, setStopRpc, type Mode } from "../shared/contracts";
+import { answerApprovalRpc, type ApprovalScope, panelHealthRpc, panelScreenshotRpc, panelStatusRpc, type PermissionAction, permissionActionRpc, type ScreenRecording, setModeRpc, setStopRpc, type Mode } from "../shared/contracts";
 import { errorText } from "./errors";
 
 function modeLabel(mode: Mode): string {
@@ -9,7 +9,7 @@ function modeLabel(mode: Mode): string {
 }
 
 function screenRecordingLabel(state: ScreenRecording): string {
-  return state === "granted" ? "granted" : state === "missing" ? "missing: grant it to Paseo, then reopen Paseo" : "not checked until the first screenshot";
+  return state === "granted" ? "granted" : state === "missing" ? "missing: grant it to Paseo, then reopen Paseo" : "not checked yet";
 }
 
 export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePanelProps) {
@@ -20,6 +20,7 @@ export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePan
   const setMode = useRpc(setModeRpc);
   const setStop = useRpc(setStopRpc);
   const answer = useRpc(answerApprovalRpc);
+  const permission = useRpc(permissionActionRpc);
   const queryClient = useQueryClient();
   const query = useQuery({ queryKey: ["computerise-panel"], queryFn: () => status({}), refetchInterval: 2_000 });
   // Its own query, so a long engine call never holds back the controls above.
@@ -32,6 +33,7 @@ export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePan
   const stop = useMutation({ mutationFn: (stopped: boolean) => setStop({ stopped }), onSuccess: refresh });
   const decide = useMutation({ mutationFn: (input: { requestId: string; agentId: string; allow: boolean; scope: ApprovalScope }) => answer(input), onSuccess: refresh });
   const change = useMutation({ mutationFn: ({ agentId, mode }: { agentId: string; mode: Mode }) => setMode({ agentId, mode }), onSuccess: refresh });
+  const fix = useMutation({ mutationFn: (action: PermissionAction) => permission({ action }), onSuccess: (fresh) => queryClient.setQueryData(["computerise-panel-health"], fresh) });
   const styles = {
     screen: { flex: 1, backgroundColor: theme.colors.surface0 } as const,
     content: { padding: layout.compact ? 14 : 22, gap: 14 } as const,
@@ -66,6 +68,15 @@ export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePan
               <Text style={health.accessibility === "missing" ? { color: theme.colors.statusWarning } : styles.muted}>Accessibility: {health.accessibility === "missing" ? "missing: grant it to Paseo" : "granted"}</Text>
             )}
             <Text style={health.screenRecording === "missing" ? { color: theme.colors.statusWarning } : styles.muted}>Screen Recording: {screenRecordingLabel(health.screenRecording)}</Text>
+            {(health.accessibility === "missing" || health.screenRecording !== "granted") && (
+              <View style={styles.row}>
+                {health.accessibility === "missing" && button("Ask macOS for Accessibility", () => fix.mutate("ask-macos-for-accessibility"), false, fix.isPending)}
+                {health.accessibility === "missing" && button("Open Accessibility settings", () => fix.mutate("open-accessibility-settings"), false, fix.isPending)}
+                {health.screenRecording !== "granted" && button("Check Screen Recording", () => fix.mutate("check-screen-recording"), false, fix.isPending)}
+                {health.screenRecording !== "granted" && button("Open Screen Recording settings", () => fix.mutate("open-screen-recording-settings"), false, fix.isPending)}
+              </View>
+            )}
+            {fix.error && <Text style={{ color: theme.colors.statusDanger }}>{errorText(fix.error)}</Text>}
           </>
         )}
         <View style={styles.row}>

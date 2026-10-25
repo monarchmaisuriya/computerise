@@ -71,6 +71,17 @@ export const healthSchema = z.object({
   engineError: z.string().nullable(),
 });
 
+// Fixed actions, so the panel can never make the plugin open an arbitrary address.
+export const permissionActionSchema = z.enum(["open-accessibility-settings", "open-screen-recording-settings", "ask-macos-for-accessibility", "check-screen-recording"]);
+export type PermissionAction = z.infer<typeof permissionActionSchema>;
+
+// Answers with fresh health, so the panel shows the result of the action at once.
+export const permissionActionRpc = defineRpc({
+  name: "computer.permission.act",
+  input: z.object({ action: permissionActionSchema }),
+  output: healthSchema,
+});
+
 // "app-for-turn" also allows later pointer actions in the same app until the agent's turn ends.
 export const approvalScopeSchema = z.enum(["once", "app-for-turn"]);
 export type ApprovalScope = z.infer<typeof approvalScopeSchema>;

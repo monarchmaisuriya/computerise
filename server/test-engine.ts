@@ -1,4 +1,4 @@
-import type { WindowOwner } from "./engine";
+import type { UiSnapshot, WindowOwner } from "./engine";
 import type { Engine } from "./mcp";
 
 export const TEXTEDIT = { name: "TextEdit", bundleId: "com.apple.TextEdit", pid: 42 };
@@ -21,6 +21,7 @@ export function fakeEngine() {
     activateBringsForward: true,
     screenRecording: "unknown" as "unknown" | "granted" | "missing",
     statusError: null as string | null,
+    elements: [{ role: "AXTextArea", label: null, value: "hello", frame: [10, 20, 300, 400] }] as UiSnapshot["elements"],
   };
   const calls: { method: string; args: unknown[] }[] = [];
   const record = (method: string) => async (...args: unknown[]) => void calls.push({ method, args });
@@ -61,10 +62,21 @@ export function fakeEngine() {
       return { jpeg: Buffer.from("zoomed"), width: 200, height: 200 };
     },
     screenRecording: () => screen.screenRecording,
+    openPrivacySettings: record("openPrivacySettings"),
+    promptAccessibility: async () => {
+      calls.push({ method: "promptAccessibility", args: [] });
+      return screen.trusted;
+    },
+    // A probe capture succeeds unless the test says Screen Recording is missing.
+    checkScreenRecording: async () => {
+      calls.push({ method: "checkScreenRecording", args: [] });
+      if (screen.screenRecording === "unknown") screen.screenRecording = "granted";
+      return screen.screenRecording;
+    },
     interrupt: () => void calls.push({ method: "interrupt", args: [] }),
     uiSnapshot: async (pid, max) => {
       calls.push({ method: "uiSnapshot", args: [pid, max] });
-      return { elements: [{ role: "AXTextArea", label: null, value: "hello", frame: [10, 20, 300, 400] }], cut: false };
+      return { elements: screen.elements, cut: false };
     },
   };
   return { engine, screen, calls, effects: () => calls.filter((call) => !["status", "windowAt", "resolveApp", "interrupt"].includes(call.method)) };

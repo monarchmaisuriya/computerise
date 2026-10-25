@@ -106,9 +106,11 @@ export class Failsafe {
     this.lastPlaced = point;
   }
 
-  tripped(cursor: Point): boolean {
+  // The agent's own placement excuses one check, its next call, so it cannot park the pointer in
+  // the corner. Reads that report an action's own result pass keepPlacement and leave it for that call.
+  tripped(cursor: Point, { keepPlacement = false } = {}): boolean {
     const placedInCorner = this.lastPlaced !== null && inCorner(this.lastPlaced);
-    this.lastPlaced = null;
+    if (!keepPlacement) this.lastPlaced = null;
     return inCorner(cursor) && !placedInCorner;
   }
 }

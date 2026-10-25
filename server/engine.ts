@@ -56,6 +56,14 @@ const activateSchema = z.object({ running: z.boolean(), activated: z.boolean() }
 const appSchema = z.object({ bundleId: z.string(), path: z.string() }).nullable();
 const windowsSchema = z.array(z.object({ id: z.number().int().positive(), x: z.number(), y: z.number(), width: z.number().positive(), height: z.number().positive() }));
 const writtenSchema = z.object({ written: z.literal(true) });
+const trustedSchema = z.object({ trusted: z.boolean() });
+
+// Fixed System Settings panes; nothing else is ever opened.
+const PRIVACY_PANES = {
+  accessibility: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+  "screen-recording": "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+} as const;
+export type PrivacyPane = keyof typeof PRIVACY_PANES;
 const snapshotSchema = z.object({
   elements: z.array(
     z.object({
@@ -155,6 +163,30 @@ export class MacEngine {
 
   status(): Promise<ScreenStatus> {
     return this.script("status", {}, statusSchema);
+  }
+
+  async openPrivacySettings(pane: PrivacyPane): Promise<void> {
+    try {
+      await this.run("open", [PRIVACY_PANES[pane]], SCRIPT_TIMEOUT_MS);
+    } catch (error) {
+      throw new Error(`Could not open System Settings: ${failureText(error)}`, { cause: error });
+    }
+  }
+
+  // Asks macOS to show its Accessibility prompt for Paseo; returns whether Paseo is trusted now.
+  async promptAccessibility(): Promise<boolean> {
+    return (await this.script("promptAccessibility", {}, trustedSchema)).trusted;
+  }
+
+  // Captures one point of the menu bar corner and deletes it, so the panel can learn whether Screen
+  // Recording is granted before any agent takes a screenshot.
+  async checkScreenRecording(): Promise<ScreenRecording> {
+    try {
+      await this.capture(["-R", "0,0,1,1"], null);
+    } catch (error) {
+      if (this.captureAccess !== "missing") throw error;
+    }
+    return this.captureAccess;
   }
 
   async windowAt(point: Point): Promise<WindowOwner | null> {

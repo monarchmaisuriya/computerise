@@ -4,12 +4,15 @@
 
 Computer use for any Paseo agent on macOS. Computerise gives Claude, Codex, OpenCode, and other MCP-capable agents tools to see and control the Mac running the Paseo daemon.
 
-Current release: **v0.3.1**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
+Current release: **v0.4.0**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
 
 ## What it provides
 
 - Screenshots and zoomed regions, optionally showing only the front app's windows
 - Text accessibility snapshots for models that cannot consume images
+- Click, move, or scroll a control by its snapshot number; refused if that control changed since
+- A report of what changed in the front window's controls after every input action
+- A `status` tool agents can call when tools fail, which works even while computer use is off
 - Mouse clicks, movement, dragging, and scrolling
 - Keyboard input and shortcuts
 - App opening and foreground restoration
@@ -21,7 +24,7 @@ Current release: **v0.3.1**. Computerise follows [Semantic Versioning](https://s
 - A one-agent-at-a-time screen lease
 - Mandatory built-in blocks for Paseo, terminals, code-running apps, System Settings, and password managers
 - Global Stop and Resume controls
-- Accessibility, Screen Recording, and engine health in the Computer panel
+- Accessibility, Screen Recording, and engine health in the Computer panel, with buttons to open the matching System Settings pane, ask macOS for the Accessibility prompt, and check Screen Recording
 - Audit logging that records typed character counts, never typed text
 
 ## Requirements
@@ -60,7 +63,7 @@ Screenshots capture the full main display by default. Turn on **Show agents only
 npm install
 npm test
 npm run typecheck
-npm run test:live   # switches the front app to TextEdit and back on this Mac
+npm run test:live   # switches the front app to TextEdit and back, and clicks once into a scratch TextEdit document
 ```
 
 The project has separate client, server, and shared runtime boundaries:

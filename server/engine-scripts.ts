@@ -142,6 +142,15 @@ function run(argv) {
   return JSON.stringify({ posted: true });
 }`;
 
+// Shows macOS's own Accessibility prompt for the app running this script (Paseo) when it is not yet
+// trusted. The option key is written out: the bridged constant is not a plain string in JXA.
+const promptAccessibility = String.raw`
+ObjC.import('ApplicationServices');
+function run() {
+  var options = $.NSDictionary.dictionaryWithObjectForKey($.NSNumber.numberWithBool(true), $('AXTrustedCheckOptionPrompt'));
+  return JSON.stringify({ trusted: $.AXIsProcessTrustedWithOptions(options) });
+}`;
+
 const activate = String.raw`
 ObjC.import('AppKit');
 function run(argv) {
@@ -270,7 +279,7 @@ function run(argv) {
   return JSON.stringify({ written: true });
 }`;
 
-export const SCRIPTS = { status, windowAt, pointer, keyboard, activate, resolveApp, uiSnapshot, windowsOf, compose } as const;
+export const SCRIPTS = { status, windowAt, pointer, keyboard, activate, resolveApp, uiSnapshot, windowsOf, compose, promptAccessibility } as const;
 export type ScriptName = keyof typeof SCRIPTS;
 
 // One long-lived osascript that runs the fixed programs above on request, so each call costs about

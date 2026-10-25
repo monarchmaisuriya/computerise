@@ -6,15 +6,16 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import Ajv2020 from "ajv/dist/2020";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ApprovalRow, type Mode, settingsSchema } from "../shared/contracts";
 import { Approvals, ApprovalScopes } from "./approvals";
 import { AuditLog } from "./audit";
+import { ElementTables } from "./elements";
 import { ComputerMcp, mcpServerEntry, SERVER_NAME, TOOL_NAMES } from "./mcp";
 import { PanelState } from "./panel-state";
 import { ControlStore, Failsafe, Lease, RateLimiter } from "./policy";
 import { Seats } from "./seats";
-import { fakeEngine, NOTES, ONE_PASSWORD, owner, PASEO } from "./test-engine";
+import { fakeEngine, NOTES, ONE_PASSWORD, owner, PASEO, TEXTEDIT } from "./test-engine";
 import { tempDir } from "./test-temp-dir";
 import { TokenAuthority } from "./tokens";
 import { PLUGIN_VERSION } from "./version";
@@ -32,9 +33,13 @@ const TOOL_ARGS: Record<string, Record<string, unknown>> = {
   open_app: { name: "Notes" },
   wait: { seconds: 0.1 },
   cursor_position: {},
+  status: {},
 };
 
-const READ_ONLY_TOOLS = ["cursor_position", "screenshot", "ui_snapshot", "wait", "zoom"];
+// status reports plugin state, so it answers while computer use is off or stopped.
+const SCREEN_TOOLS = Object.keys(TOOL_ARGS).filter((tool) => tool !== "status");
+
+const READ_ONLY_TOOLS = ["cursor_position", "screenshot", "status", "ui_snapshot", "wait", "zoom"];
 
 describe("the computer MCP endpoint", () => {
   let mac: ReturnType<typeof fakeEngine>;
@@ -48,6 +53,7 @@ describe("the computer MCP endpoint", () => {
   let auditPath: string;
   let computer: ComputerMcp;
   let panel: PanelState;
+  let calls: RateLimiter;
   let currentSettings: ReturnType<typeof settingsSchema.parse>;
   let http: Server;
   let port: number;
@@ -65,6 +71,7 @@ describe("the computer MCP endpoint", () => {
     lease = new Lease(120_000);
     auditPath = join(root, "audit.jsonl");
     panel = new PanelState();
+    calls = new RateLimiter(120, 60_000);
     currentSettings = settingsSchema.parse({});
     computer = new ComputerMcp({
       engine: mac.engine,
@@ -72,11 +79,12 @@ describe("the computer MCP endpoint", () => {
       seats,
       control,
       lease,
-      calls: new RateLimiter(120, 60_000),
+      calls,
       rates: new RateLimiter(60, 60_000),
       failsafe: new Failsafe(),
       approvals,
       scopes,
+      elements: new ElementTables(),
       audit: new AuditLog(auditPath),
       panel,
       settings: async () => currentSettings,
@@ -168,10 +176,10 @@ describe("the computer MCP endpoint", () => {
     expect(result.isError).toBe(false);
     expect(result.text).toContain("Done: click left at (400, 220) on TextEdit");
     expect(result.content.filter((part) => part.type === "image")).toHaveLength(1);
-    expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot", "click", "screenshot"]);
+    expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot", "uiSnapshot", "click", "uiSnapshot", "screenshot"]);
     const audited = (await readFile(auditPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    expect(audited.map((entry) => [entry.tool, entry.outcome])).toEqual([["screenshot", "ok"], ["click", "ok"], ["screenshot", "ok"]]);
-    expect(panel.snapshot().recent.map((entry) => entry.tool)).toEqual(["screenshot", "click", "screenshot"]);
+    expect(audited.map((entry) => [entry.tool, entry.outcome])).toEqual([["screenshot", "ok"], ["click", "ok"], ["ui_snapshot", "ok"], ["screenshot", "ok"]]);
+    expect(panel.snapshot().recent.map((entry) => entry.tool)).toEqual(["screenshot", "ui_snapshot", "click", "screenshot"]);
   });
 
   it("reports the action as done but sends no image when a blocked app is in front afterwards", async () => {
@@ -189,20 +197,73 @@ describe("the computer MCP endpoint", () => {
     expect(result.content.filter((part) => part.type === "image")).toHaveLength(0);
   });
 
-  it.each(Object.keys(TOOL_ARGS))("%s does nothing on the Mac while the agent's mode is off", async (tool) => {
+  it.each(SCREEN_TOOLS)("%s does nothing on the Mac while the agent's mode is off", async (tool) => {
     const client = await agent("agent-x", "off");
     const result = await call(client, tool);
     expect(result).toMatchObject({ isError: true, text: "Computer use is off for this agent; the user can turn it on with /computer ask" });
     expect(mac.calls).toEqual([]);
   });
 
-  it.each(Object.keys(TOOL_ARGS))("%s does nothing on the Mac while computer use is stopped", async (tool) => {
+  it.each(SCREEN_TOOLS)("%s does nothing on the Mac while computer use is stopped", async (tool) => {
     const client = await agent("agent-x", "auto");
     await control.setStopped(true);
     const result = await call(client, tool);
     expect(result.isError).toBe(true);
     expect(result.text).toContain("Computer use is stopped by the user");
     expect(mac.calls).toEqual([]);
+  });
+
+  describe("the status tool", () => {
+    it("tells an agent whose mode is off how the user turns it on, reading only the status script", async () => {
+      const client = await agent("agent-x", "off");
+      const result = await call(client, "status");
+      expect(result).toMatchObject({ isError: false });
+      expect(result.text).toBe(
+        [
+          "Mode: off; the user can turn it on with /computer ask or /computer auto",
+          "Not stopped",
+          "Screen: free",
+          "Accessibility: granted",
+          "Screen Recording: not checked yet; the user can check it in the Computer panel",
+          "Working app: none; take a screenshot or ui_snapshot first",
+          "Element numbers: none; call ui_snapshot",
+        ].join("\n"),
+      );
+      expect(mac.calls.map((entry) => entry.method)).toEqual(["status"]);
+    });
+
+    it("reports a stop, another agent holding the screen, and missing permissions", async () => {
+      const other = await agent("agent-y", "auto");
+      await call(other, "screenshot");
+      const client = await agent("agent-x", "ask");
+      await control.setStopped(true);
+      mac.screen.trusted = false;
+      mac.screen.screenRecording = "missing";
+      const text = (await call(client, "status")).text;
+      expect(text).toContain("Mode: ask (the user approves each input action)");
+      expect(text).toContain("Stopped by the user; they can resume it from the Computer panel");
+      expect(text).toContain("Screen: held by agent title of agent-y");
+      expect(text).toContain("Accessibility: missing; the user grants it to Paseo in System Settings > Privacy & Security > Accessibility, or from the Computer panel");
+      expect(text).toContain("Screen Recording: missing; the user grants it to Paseo in System Settings > Privacy & Security > Screen Recording, then reopens Paseo");
+    });
+
+    it("names the agent's working app and element numbers once it has them", async () => {
+      const client = await agent("agent-x", "auto");
+      await call(client, "ui_snapshot");
+      const text = (await call(client, "status")).text;
+      expect(text).toContain("Screen: held by you");
+      expect(text).toContain("Working app: TextEdit (com.apple.TextEdit)");
+      expect(text).toContain("Element numbers: 1 controls from TextEdit");
+    });
+
+    it("still needs a bound seat and counts toward the call limit", async () => {
+      const unbound = await connect(`Bearer ${tokens.mint({ seat: seats.mint() })}`);
+      expect(await call(unbound, "status")).toMatchObject({ isError: true, text: "Computer use is not ready for this agent yet; try again in a moment" });
+      const client = await agent("agent-x", "off");
+      const take = vi.spyOn(calls, "take");
+      await call(client, "status");
+      expect(take).toHaveBeenCalledWith("agent-x");
+    });
   });
 
   it("refuses a token whose seat is not bound to an agent yet", async () => {
@@ -220,7 +281,7 @@ describe("the computer MCP endpoint", () => {
     expect(shot.text).toContain("front app: TextEdit (com.apple.TextEdit)");
     const typed = await call(client, "type", { text: "hunter2!" });
     expect(typed.isError).toBe(false);
-    expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot", "type"]);
+    expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot", "uiSnapshot", "type", "uiSnapshot"]);
     expect(mac.calls.find((effect) => effect.method === "type")?.args).toEqual(["hunter2!", "com.apple.TextEdit"]);
     expect(rows).toEqual([]);
     const audit = await readFile(auditPath, "utf8");
@@ -321,9 +382,13 @@ describe("the computer MCP endpoint", () => {
     expect((await call(client, "open_app", { name: "Notes" })).isError).toBe(false);
     await call(client, "key");
     expect(mac.effects().map((effect) => [effect.method, effect.args[0]])).toEqual([
+      ["uiSnapshot", TEXTEDIT.pid],
       ["openApp", "com.apple.Notes"],
+      ["uiSnapshot", TEXTEDIT.pid],
       ["activate", "com.apple.Notes"],
+      ["uiSnapshot", NOTES.pid],
       ["key", "cmd+s"],
+      ["uiSnapshot", NOTES.pid],
     ]);
   });
 
@@ -342,7 +407,9 @@ describe("the computer MCP endpoint", () => {
     expect(mac.effects().map((effect) => [effect.method, effect.args[0]])).toEqual([
       ["screenshot", null],
       ["activate", "com.apple.TextEdit"],
+      ["uiSnapshot", TEXTEDIT.pid],
       ["type", "hello"],
+      ["uiSnapshot", TEXTEDIT.pid],
     ]);
   });
 
@@ -370,7 +437,7 @@ describe("the computer MCP endpoint", () => {
     const otherRow = await nextRow(3);
     approvals.answer(otherRow.row.requestId, "agent-x", false);
     expect((await other).isError).toBe(true);
-    expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot", "click", "scroll", "move"]);
+    expect(mac.effects().map((effect) => effect.method).filter((method) => method !== "uiSnapshot")).toEqual(["screenshot", "click", "scroll", "move"]);
   });
 
   it("refuses an approved action when the agent lost the screen while waiting", async () => {
@@ -397,11 +464,13 @@ describe("the computer MCP endpoint", () => {
     expect(mac.effects().filter((effect) => effect.method === "type" || effect.method === "key").map((effect) => effect.args.at(-1))).toEqual(["com.apple.TextEdit", "com.apple.TextEdit"]);
   });
 
+  // The state read after the action comes first: it catches the corner push and stops computer use,
+  // so the screenshot is then refused as stopped.
   it.each([
-    ["the agent is turned off", async () => control.setMode("agent-x", "off"), "Computer use is off for this agent"],
-    ["the user stops computer use", async () => computer.stopAll(), "Computer use is stopped by the user"],
-    ["the user pushes the pointer into the corner", async () => void (mac.screen.cursor = { x: 0, y: 0 }), "The pointer is in the top-left corner"],
-  ])("sends no screenshot after an action when %s during it", async (_case, happen, reason) => {
+    ["the agent is turned off", async () => control.setMode("agent-x", "off"), "Computer use is off for this agent", "Computer use is off for this agent"],
+    ["the user stops computer use", async () => computer.stopAll(), "Computer use is stopped by the user", "Computer use is stopped by the user"],
+    ["the user pushes the pointer into the corner", async () => void (mac.screen.cursor = { x: 0, y: 0 }), "The pointer is in the top-left corner", "Computer use is stopped by the user"],
+  ])("sends no state or screenshot after an action when %s during it", async (_case, happen, stateReason, reason) => {
     const client = await agent("agent-x", "auto");
     await call(client, "screenshot");
     const click = mac.engine.click;
@@ -412,6 +481,7 @@ describe("the computer MCP endpoint", () => {
     const result = await call(client, "click", { x: 400, y: 220, screenshot: true });
     expect(result.isError).toBe(false);
     expect(result.text).toContain("Done: click left at (400, 220) on TextEdit");
+    expect(result.text).toContain(`No state: ${stateReason}`);
     expect(result.text).toContain(`No screenshot: ${reason}`);
     expect(result.content.filter((part) => part.type === "image")).toHaveLength(0);
     expect(mac.effects().filter((effect) => effect.method === "screenshot")).toHaveLength(1);
@@ -558,6 +628,206 @@ describe("the computer MCP endpoint", () => {
     const result = await call(client, "ui_snapshot", { max_elements: 50 });
     expect(result.text).toContain('AXTextArea value="hello" at 10,20 300x400');
     expect(mac.calls.find((effect) => effect.method === "uiSnapshot")?.args).toEqual([42, 50]);
+  });
+
+  describe("acting on a control by its ui_snapshot number", () => {
+    const FIELD = { role: "AXTextField", label: "Name", value: "ab", frame: [10, 20, 300, 24] as [number, number, number, number] };
+    const SAVE = { role: "AXButton", label: "Save", value: null, frame: [100, 200, 80, 30] as [number, number, number, number] };
+    const DELETE = { ...SAVE, label: "Delete" };
+    const methods = () => mac.effects().map((effect) => effect.method);
+
+    beforeEach(() => {
+      mac.screen.elements = [FIELD, SAVE];
+    });
+
+    it("clicks, moves to, and scrolls at the control's middle after re-reading the window", async () => {
+      const client = await agent("agent-x", "auto");
+      await call(client, "ui_snapshot");
+      const done = async (args: Record<string, unknown>, tool = "click") => (await call(client, tool, args)).text.split("\n")[0];
+      expect(await done({ element: 2 })).toBe('Done: click left on element 2 (AXButton "Save") at (140, 215) on TextEdit');
+      expect(await done({ element: 1 }, "move")).toBe('Done: move the pointer to element 1 (AXTextField "Name") at (160, 32) over TextEdit');
+      expect(await done({ element: 1, direction: "down" }, "scroll")).toBe('Done: scroll down 3 on element 1 (AXTextField "Name") at (160, 32) on TextEdit');
+      expect(mac.effects().filter((effect) => effect.method !== "uiSnapshot").map((effect) => [effect.method, effect.args[0]])).toEqual([
+        ["click", { x: 140, y: 215 }],
+        ["move", { x: 160, y: 32 }],
+        ["scroll", { x: 160, y: 32 }],
+      ]);
+      // One ui_snapshot, then per action one fresh read (also the before state) and one after it.
+      expect(methods().filter((method) => method === "uiSnapshot")).toHaveLength(7);
+    });
+
+    it("refuses an element number before any ui_snapshot", async () => {
+      const client = await agent("agent-x", "auto");
+      await call(client, "screenshot");
+      expect(await call(client, "click", { element: 1 })).toMatchObject({ isError: true, text: "No element numbers yet: call ui_snapshot first" });
+      expect(methods()).toEqual(["screenshot"]);
+    });
+
+    it.each([
+      ["both an element and a point", { element: 1, x: 5, y: 5 }],
+      ["neither an element nor a full point", { x: 5 }],
+    ])("refuses %s before asking or acting", async (_case, args) => {
+      const client = await agent("agent-x", "ask");
+      await call(client, "ui_snapshot");
+      expect(await call(client, "click", args)).toMatchObject({ isError: true, text: "Give either element, or both x and y" });
+      expect(rows).toEqual([]);
+      expect(methods()).toEqual(["uiSnapshot"]);
+    });
+
+    it("refuses a control that changed since the ui_snapshot, posting nothing", async () => {
+      const client = await agent("agent-x", "auto");
+      await call(client, "ui_snapshot");
+      mac.screen.elements = [FIELD, { ...SAVE, frame: [140, 200, 80, 30] }];
+      const result = await call(client, "click", { element: 2 });
+      expect(result).toMatchObject({ isError: true, text: 'Element 2 changed since your last ui_snapshot (was AXButton "Save", now AXButton "Save" at 140,200); call ui_snapshot again' });
+      expect(methods()).not.toContain("click");
+    });
+
+    it("refuses a control another app's window covers", async () => {
+      const client = await agent("agent-x", "auto");
+      await call(client, "ui_snapshot");
+      mac.screen.under = owner(NOTES);
+      expect(await call(client, "click", { element: 2 })).toMatchObject({ isError: true, text: "Element 2 is not on TextEdit's window at (140, 215): Notes is there" });
+      expect(methods()).not.toContain("click");
+    });
+
+    it("asks with the control's name, and compares the approved control even if a later ui_snapshot renumbered the window", async () => {
+      const client = await agent("agent-x", "ask");
+      await call(client, "ui_snapshot");
+      const pending = call(client, "click", { element: 2 });
+      const { row } = await nextRow(1);
+      expect(row).toMatchObject({ action: 'click left on element 2 (AXButton "Save") at (140, 215) on TextEdit', app: "TextEdit" });
+      mac.screen.elements = [FIELD, DELETE];
+      await call(client, "ui_snapshot");
+      approvals.answer(row.requestId, "agent-x", true);
+      expect(await pending).toMatchObject({ isError: true, text: expect.stringContaining('Element 2 changed since your last ui_snapshot (was AXButton "Save", now AXButton "Delete"') });
+      expect(methods()).not.toContain("click");
+    });
+
+    it("forgets element numbers when the user stops computer use", async () => {
+      const client = await agent("agent-x", "auto");
+      await call(client, "ui_snapshot");
+      await computer.stopAll();
+      await control.setStopped(false);
+      await call(client, "screenshot");
+      expect(await call(client, "click", { element: 2 })).toMatchObject({ isError: true, text: "No element numbers yet: call ui_snapshot first" });
+    });
+  });
+
+  describe("reporting what each action changed", () => {
+    const FIELD = { role: "AXTextField", label: "Name", value: "ab", frame: [10, 20, 300, 24] as [number, number, number, number] };
+    const SAVE = { role: "AXButton", label: "Save", value: null, frame: [100, 200, 80, 30] as [number, number, number, number] };
+    const DONE = { role: "AXButton", label: "Done", value: null, frame: [200, 200, 80, 30] as [number, number, number, number] };
+    const snapshotPids = () => mac.calls.filter((entry) => entry.method === "uiSnapshot").map((entry) => entry.args[0]);
+
+    beforeEach(() => {
+      mac.screen.elements = [FIELD, SAVE];
+    });
+
+    it("says when the front window's controls did not change", async () => {
+      const client = await agent("agent-x", "auto");
+      await call(client, "screenshot");
+      const result = await call(client, "click", { x: 400, y: 220 });
+      expect(result).toMatchObject({ isError: false });
+      expect(result.text).toBe(
+        "Done: click left at (400, 220) on TextEdit\nNo change detected in TextEdit's controls. The action may have done nothing, or changed something the accessibility tree does not show; take a screenshot to check.",
+      );
+      expect(snapshotPids()).toEqual([42, 42]);
+    });
+
+    it("lists what changed, numbered so the next action can use the new numbers", async () => {
+      const client = await agent("agent-x", "auto");
+      await call(client, "screenshot");
+      const click = mac.engine.click;
+      mac.engine.click = async (...args) => {
+        await click(...args);
+        mac.screen.elements = [{ ...FIELD, value: "abc" }, DONE];
+      };
+      const result = await call(client, "click", { x: 400, y: 220 });
+      expect(result.text).toContain('Changed in TextEdit (3 changes; 2 controls now):\n~ 1. AXTextField "Name" value "abc" (was "ab")\n+ 2. AXButton "Done"\n- AXButton "Save"');
+      mac.engine.click = click;
+      expect((await call(client, "click", { element: 2 })).text).toContain('Done: click left on element 2 (AXButton "Done") at (240, 215) on TextEdit');
+    });
+
+    it("names the new front app when the action brought one forward", async () => {
+      const client = await agent("agent-x", "auto");
+      mac.engine.openApp = async (bundleId) => {
+        mac.calls.push({ method: "openApp", args: [bundleId] });
+        mac.screen.front = NOTES;
+        mac.screen.elements = [SAVE];
+      };
+      expect((await call(client, "open_app", { name: "Notes" })).text).toBe(
+        "Done: open Notes (com.apple.Notes)\nFront app is now Notes (1 controls); element numbers now refer to its front window.",
+      );
+    });
+
+    it("never reads a front app blocked from view before acting", async () => {
+      const client = await agent("agent-x", "auto");
+      mac.screen.front = ONE_PASSWORD;
+      mac.engine.openApp = async (bundleId) => {
+        mac.calls.push({ method: "openApp", args: [bundleId] });
+        mac.screen.front = NOTES;
+      };
+      const result = await call(client, "open_app", { name: "Notes" });
+      expect(result.text).toContain("Front app is now Notes");
+      expect(snapshotPids()).toEqual([NOTES.pid]);
+    });
+
+    it("reports no state and forgets element numbers when a blocked app is in front after the action", async () => {
+      const client = await agent("agent-x", "auto");
+      await call(client, "ui_snapshot");
+      const click = mac.engine.click;
+      mac.engine.click = async (...args) => {
+        await click(...args);
+        mac.screen.front = ONE_PASSWORD;
+      };
+      const result = await call(client, "click", { x: 400, y: 220 });
+      expect(result).toMatchObject({ isError: false, text: "Done: click left at (400, 220) on TextEdit\nNo state: 1Password (com.1password.1password) is blocked from view" });
+      mac.engine.click = click;
+      mac.screen.front = TEXTEDIT;
+      expect((await call(client, "click", { element: 1 })).text).toBe("No element numbers yet: call ui_snapshot first");
+    });
+
+    it("keeps the app open_app opened as the working app while it is still launching", async () => {
+      const client = await agent("agent-x", "auto");
+      await call(client, "screenshot");
+      mac.screen.activateBringsForward = false;
+      expect((await call(client, "open_app", { name: "Notes" })).isError).toBe(false);
+      expect(await call(client, "type", { text: "hi" })).toMatchObject({ isError: true, text: "Notes did not come to the front; take a new screenshot" });
+      expect(mac.effects().filter((effect) => effect.method === "type")).toEqual([]);
+    });
+
+    it("reuses the element action's own fresh read as the before state", async () => {
+      const client = await agent("agent-x", "auto");
+      await call(client, "ui_snapshot");
+      await call(client, "click", { element: 2 });
+      expect(snapshotPids()).toEqual([42, 42, 42]);
+    });
+
+    it("never takes the screen back after an action when the agent let go of it during the action", async () => {
+      const client = await agent("agent-x", "auto");
+      await call(client, "screenshot");
+      const click = mac.engine.click;
+      mac.engine.click = async (...args) => {
+        await click(...args);
+        lease.release("agent-x");
+      };
+      const result = await call(client, "click", { x: 400, y: 220, screenshot: true });
+      expect(result.text).toContain("No state: The screen was released after this action (for example, the agent's turn ended)");
+      expect(result.text).toContain("No screenshot: The screen was released after this action (for example, the agent's turn ended)");
+      expect(lease.holderId()).toBe(null);
+      expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot", "uiSnapshot", "click"]);
+    });
+
+    it("audits the read after an action without charging it to the agent's call limit", async () => {
+      const client = await agent("agent-x", "auto");
+      await call(client, "screenshot");
+      const take = vi.spyOn(calls, "take");
+      await call(client, "click", { x: 400, y: 220 });
+      expect(take).toHaveBeenCalledTimes(1);
+      const audited = (await readFile(auditPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+      expect(audited.map((entry) => [entry.tool, entry.outcome])).toEqual([["screenshot", "ok"], ["click", "ok"], ["ui_snapshot", "ok"]]);
+    });
   });
 
   it("refuses arguments outside their schema before reaching the Mac", async () => {

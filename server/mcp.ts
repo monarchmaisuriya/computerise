@@ -5,7 +5,8 @@ import { z } from "zod";
 import type { Mode, Settings } from "../shared/contracts";
 import { type Approvals, type ApprovalScopes, singleApp } from "./approvals";
 import type { AuditLog } from "./audit";
-import { LIMITS, type MacEngine, type MouseButton, type Point, type ScreenStatus, type ScrollDirection } from "./engine";
+import { center, describeChange, describeElement, type ElementTables, type ExpectedElement, matchLive, pickElement } from "./elements";
+import { LIMITS, type MacEngine, type MouseButton, type Point, type ScreenStatus, type ScrollDirection, type UiSnapshot } from "./engine";
 import { type AppRef, blockLevel, type ControlStore, type Failsafe, type Lease, LeaseHeldError, type RateLimiter } from "./policy";
 import type { Seats } from "./seats";
 import type { TokenAuthority } from "./tokens";
@@ -14,23 +15,25 @@ import { PLUGIN_VERSION } from "./version";
 
 // Distinctive name: Paseo preapproves this server's tools by name, so a user's own server must not share it.
 export const SERVER_NAME = "paseo-computerise";
-export const TOOL_NAMES = ["click", "cursor_position", "drag", "key", "move", "open_app", "screenshot", "scroll", "type", "ui_snapshot", "wait", "zoom"] as const;
+export const TOOL_NAMES = ["click", "cursor_position", "drag", "key", "move", "open_app", "screenshot", "scroll", "status", "type", "ui_snapshot", "wait", "zoom"] as const;
 const PATH = "/mcp";
 const MAX_REQUEST_BYTES = 64 * 1024;
 const FRONT_WAIT_MS = 1_000;
 const FRONT_POLL_MS = 100;
 const SHOWN_TEXT_CHARS = 300;
-// Time for the screen to redraw before the screenshot an action was asked to return.
+// Time for the screen to redraw before the reads that report an action's result.
 const SETTLE_MS = 300;
+const SNAPSHOT_ELEMENTS = 200;
 const MAX_WAIT_SECONDS = 10;
 
 export const OFF_MESSAGE = "Computer use is off for this agent; the user can turn it on with /computer ask";
 const NOT_READY = "Computer use is not ready for this agent yet; try again in a moment";
 const STOPPED = "Computer use is stopped by the user; they can resume it from the Computer panel";
+const ELEMENT_OR_POINT = "Give either element, or both x and y";
 
 export type Engine = Pick<
   MacEngine,
-  "status" | "windowAt" | "activate" | "resolveApp" | "openApp" | "click" | "move" | "drag" | "scroll" | "type" | "key" | "screenshot" | "zoom" | "uiSnapshot" | "screenRecording" | "interrupt"
+  "status" | "windowAt" | "activate" | "resolveApp" | "openApp" | "click" | "move" | "drag" | "scroll" | "type" | "key" | "screenshot" | "zoom" | "uiSnapshot" | "screenRecording" | "interrupt" | "openPrivacySettings" | "promptAccessibility" | "checkScreenRecording"
 >;
 
 export interface ComputerMcpOptions {
@@ -44,6 +47,7 @@ export interface ComputerMcpOptions {
   failsafe: Failsafe;
   approvals: Approvals;
   scopes: ApprovalScopes;
+  elements: ElementTables;
   audit: AuditLog;
   panel?: PanelState;
   settings(): Promise<Settings>;
@@ -71,20 +75,31 @@ function capturedPid(status: ScreenStatus, settings: Settings): number | null {
   return status.front.pid;
 }
 
-// The receivers are the apps that get the input. They are read before approval ("planned") and
-// again after the working app is back in front ("actual"); both must match and pass the blocklist.
+// What an action acts on: the receivers (the apps that get the input) and, for pointer actions,
+// the point, plus the control it names when given by element number. live is the window read just
+// before acting, for an element action.
+type Target = { apps: AppRef[]; point: Point | null; element: ExpectedElement | null; live?: UiSnapshot };
+
+// The front window's controls just before an action, compared with a read after it; before is null
+// when nothing was read (no app in front, or one blocked from view).
+type Observed = { before: { pid: number; elements: UiSnapshot["elements"] } | null; max: number };
+
+// The target is resolved before approval (planned is null) and again after the working app is back
+// in front, given the planned target; both must name the same apps and pass the blocklist.
 type ActionSpec<A> = {
   kind: "action";
   needsWorkingApp: boolean;
   // Pointer actions the user may allow for one app for the rest of the turn. Typing, keys, and
   // opening apps always ask.
   scopable?: true;
-  receivers(args: A, working: AppRef | null, phase: "planned" | "actual"): Promise<AppRef[]>;
-  describe(args: A, receivers: AppRef[]): string;
-  act(args: A, receivers: AppRef[]): Promise<void>;
-  after?(agentId: string, args: A, receivers: AppRef[]): void;
+  target(agentId: string, args: A, working: AppRef | null, planned: Target | null): Promise<Target>;
+  describe(args: A, target: Target): string;
+  act(args: A, target: Target): Promise<void>;
+  after?(agentId: string, args: A, target: Target): void;
   chars?(args: A): number;
 };
+
+type PointerArgs = { x?: number; y?: number; element?: number };
 
 // Touches nothing on the Mac; still subject to identity, stop, mode, and rate checks.
 type PauseSpec<A> = {
@@ -92,7 +107,15 @@ type PauseSpec<A> = {
   run(args: A): Promise<Content[]>;
 };
 
-type ToolSpec<A> = ReadSpec<A> | ActionSpec<A> | PauseSpec<A>;
+// Reports the plugin's own state and reads only the status script. The one kind that answers while
+// computer use is off or stopped, so the agent can tell the user what to do; it still needs a bound
+// seat and counts toward the call limit.
+type InfoSpec = {
+  kind: "info";
+  run(agentId: string): Promise<Content[]>;
+};
+
+type ToolSpec<A> = ReadSpec<A> | ActionSpec<A> | PauseSpec<A> | InfoSpec;
 
 function textContent(text: string): Content[] {
   return [{ type: "text", text }];
@@ -112,6 +135,18 @@ function receiverId(app: AppRef | undefined): string {
   return app.bundleId;
 }
 
+// Pointer targets always carry a point; only keyboard and open_app targets have none.
+function pointOf(target: Target): Point {
+  if (!target.point) throw new Error("A pointer action reached the Mac without a resolved point");
+  return target.point;
+}
+
+// "(400, 220)", or "element 2 (AXButton "Save") at (140, 215)" when the agent named a control.
+function where(target: Target): string {
+  const point = at(pointOf(target));
+  return target.element ? `element ${target.element.number} (${describeElement(target.element.element)}) at ${point}` : point;
+}
+
 function sameApps(a: AppRef[], b: AppRef[]): boolean {
   return a.length === b.length && a.every((app, i) => app.bundleId === b[i].bundleId);
 }
@@ -125,6 +160,7 @@ const coordinate = z.number().describe("Main-display points, as read off the scr
 // 2020-12 rejects, and with it Anthropic's API and every client that forwards to it.
 const pair = z.array(coordinate).length(2).describe("[x, y] in main-display points");
 const screenshotAfter = z.boolean().optional().describe("Also return a screenshot taken just after the action");
+const elementNumber = z.number().int().min(1).max(LIMITS.snapshotElements).optional().describe("A control's number from your last ui_snapshot, instead of x and y");
 
 function wantsScreenshot(args: unknown): boolean {
   return Reflect.get(Object(args), "screenshot") === true;
@@ -153,6 +189,30 @@ export class ComputerMcp {
     };
   }
 
+  // Reads the front window's controls through the read checks; once the read is accepted they become
+  // the agent's element numbers. report turns the read into the text the agent gets.
+  private controlsSpec(max: number, report: (front: NonNullable<ScreenStatus["front"]>, snapshot: UiSnapshot) => string): ReadSpec<Record<string, never>> {
+    return {
+      kind: "read",
+      run: async (agentId, _args, status) => {
+        const front = status.front;
+        if (!front) throw new Refusal("No app is in front");
+        const snapshot = await this.options.engine.uiSnapshot(front.pid, max);
+        return {
+          content: textContent(report(front, snapshot)),
+          accepted: () => this.options.elements.set(agentId, { pid: front.pid, app: { bundleId: front.bundleId, name: front.name }, max, elements: snapshot.elements }),
+        };
+      },
+    };
+  }
+
+  // Never reads an app blocked from view, the same rule the read path applies.
+  private async controlsBefore(status: ScreenStatus, settings: Settings, max: number): Promise<Observed["before"]> {
+    const front = status.front;
+    if (!front || blockLevel(front.bundleId, settings) === "no-view") return null;
+    return { pid: front.pid, elements: (await this.options.engine.uiSnapshot(front.pid, max)).elements };
+  }
+
   async stopAll(): Promise<void> {
     let persistenceError: unknown;
     await this.options.control.setStopped(true).catch((error: unknown) => {
@@ -160,6 +220,7 @@ export class ComputerMcp {
     });
     this.options.approvals.cancelAll();
     this.options.scopes.clearAll();
+    this.options.elements.clearAll();
     this.options.lease.releaseAll();
     this.options.engine.interrupt();
     if (persistenceError) throw persistenceError;
@@ -204,14 +265,16 @@ export class ComputerMcp {
     throw new Refusal(`${app.name} did not come to the front; take a new screenshot`);
   }
 
-  private async read<A>(agentId: string, spec: ReadSpec<A>, args: A, status: ScreenStatus, settings: Settings) {
+  private async read<A>(agentId: string, spec: ReadSpec<A>, args: A, status: ScreenStatus, settings: Settings, afterAction: boolean) {
     const front = status.front;
     if (front && blockLevel(front.bundleId, settings) === "no-view") throw new Refusal(`${appLabel(front)} is blocked from view`);
     const result = await spec.run(agentId, args, status, settings);
     const after = await this.options.engine.status();
     if (after.front && blockLevel(after.front.bundleId, settings) === "no-view") throw new Refusal(`${appLabel(after.front)} is blocked from view`);
     if (after.front?.pid !== front?.pid || after.front?.bundleId !== front?.bundleId) throw new Refusal("The screen changed while reading; try again");
-    if (front) this.options.lease.setWorkingApp(agentId, { bundleId: front.bundleId, name: front.name });
+    // Input goes where the agent chose to look or what it opened; an automatic read after an action
+    // (for example while an app opened by open_app is still launching) never redirects it.
+    if (front && !afterAction) this.options.lease.setWorkingApp(agentId, { bundleId: front.bundleId, name: front.name });
     result.accepted?.();
     return { content: result.content, target: front?.bundleId ?? null };
   }
@@ -220,12 +283,12 @@ export class ComputerMcp {
     const { approvals, scopes, lease } = this.options;
     const working = lease.workingApp(agentId);
     if (spec.needsWorkingApp && working === null) throw new Refusal("Take a screenshot first, so the plugin knows which app you are working in");
-    const planned = await spec.receivers(args, working, "planned");
-    this.requireInputAllowed(planned, settings);
+    const planned = await spec.target(agentId, args, working, null);
+    this.requireInputAllowed(planned.apps, settings);
     const description = spec.describe(args, planned);
-    if (mode === "ask" && !(spec.scopable && scopes.covers(agentId, planned))) {
-      const scopeApp = spec.scopable ? singleApp(planned) : null;
-      const decision = await approvals.request(agentId, description, [...new Set(planned.map((app) => app.name))].join(", "), scopeApp?.name ?? null);
+    if (mode === "ask" && !(spec.scopable && scopes.covers(agentId, planned.apps))) {
+      const scopeApp = spec.scopable ? singleApp(planned.apps) : null;
+      const decision = await approvals.request(agentId, description, [...new Set(planned.apps.map((app) => app.name))].join(", "), scopeApp?.name ?? null);
       if (decision === "deny") throw new Refusal("The user denied this action");
       if (decision === "timeout") throw new Refusal("The user did not answer in time; nothing was done");
       if (decision === "cancelled") throw new Refusal("The request was withdrawn before it was answered (Stop, a mode change, or the end of the agent's turn); nothing was done");
@@ -235,8 +298,8 @@ export class ComputerMcp {
     return this.exclusive(async () => {
       if (lease.holderId() !== agentId) throw new Refusal("The screen was released while this action waited (for example, the agent's turn ended); take a new screenshot");
       if (spec.needsWorkingApp && working !== null) await this.bringForward(working);
-      const actual = await spec.receivers(args, working, "actual");
-      if (!sameApps(planned, actual)) throw new Refusal("The screen changed while waiting; take a new screenshot");
+      const actual = await spec.target(agentId, args, working, planned);
+      if (!sameApps(planned.apps, actual.apps)) throw new Refusal("The screen changed while waiting; take a new screenshot");
       const executionStatus = await this.options.engine.status();
       const executionSettings = await this.options.settings();
       this.requireRunning(agentId);
@@ -244,57 +307,99 @@ export class ComputerMcp {
         await this.stopAll();
         throw new Refusal("The pointer is in the top-left corner, so computer use is now stopped; the user can resume it from the Computer panel");
       }
-      this.requireInputAllowed(actual, executionSettings);
+      this.requireInputAllowed(actual.apps, executionSettings);
+      const max = this.options.elements.get(agentId)?.max ?? SNAPSHOT_ELEMENTS;
+      const before = actual.live && actual.element ? { pid: actual.element.pid, elements: actual.live.elements } : await this.controlsBefore(executionStatus, executionSettings, max);
       await spec.act(args, actual);
       spec.after?.(agentId, args, actual);
-      return { content: textContent(`Done: ${description}`), target: actual.map((app) => app.bundleId).join(",") };
+      const observed: Observed = { before, max };
+      return { content: textContent(`Done: ${description}`), target: actual.apps.map((app) => app.bundleId).join(","), observed };
     });
   }
 
-  // The action already happened, so a refused or failed screenshot is reported, not raised. It passes
-  // the same stop, mode, rate, corner, and lease checks as a screenshot the agent asked for
-  // separately, and is audited as one.
-  private async screenshotAfterAction(agentId: string): Promise<Content[]> {
+  // The action already happened, so a refused or failed read after it is reported, not raised. It
+  // passes the same stop, mode, corner, lease, and view checks as a read the agent asked for
+  // separately, and is audited as one. The state read belongs to every action, so only a screenshot
+  // the agent asked for is charged to its call limit.
+  private async readAfterAction(agentId: string, tool: "screenshot" | "ui_snapshot", spec: ReadSpec<Record<string, never>>, refusal: string): Promise<Content[]> {
     const { audit, panel, calls } = this.options;
-    await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
     let target: string | null = null;
     try {
       const mode = this.requireRunning(agentId);
-      calls.take(agentId);
-      const result = await this.onScreen(agentId, mode, this.screenshotSpec, {});
+      if (tool === "screenshot") calls.take(agentId);
+      const result = await this.onScreen(agentId, mode, spec, {}, true);
       target = result.target;
-      await audit.record({ agentId, tool: "screenshot", target, outcome: "ok" });
-      panel?.activity({ agentId, tool: "screenshot", target, outcome: "ok" });
+      await audit.record({ agentId, tool, target, outcome: "ok" });
+      panel?.activity({ agentId, tool, target, outcome: "ok" });
       return result.content;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const outcome = error instanceof Refusal ? `refused: ${message}` : `error: ${message}`;
-      await audit.record({ agentId, tool: "screenshot", target, outcome }).catch((auditError: unknown) => console.error(`[computerise] audit write failed: ${String(auditError)}`));
-      panel?.activity({ agentId, tool: "screenshot", target, outcome });
-      return textContent(`No screenshot: ${message}`);
+      await audit.record({ agentId, tool, target, outcome }).catch((auditError: unknown) => console.error(`[computerise] audit write failed: ${String(auditError)}`));
+      panel?.activity({ agentId, tool, target, outcome });
+      return textContent(`${refusal}: ${message}`);
     }
   }
 
-  private async onScreen<A>(agentId: string, mode: Mode, spec: ReadSpec<A> | ActionSpec<A>, args: A) {
+  // What the action changed in the front window. Numbers from before the action may now name other
+  // controls, so they are replaced by this read, or dropped if it is refused.
+  private async stateAfterAction(agentId: string, { before, max }: Observed): Promise<Content[]> {
+    this.options.elements.clear(agentId);
+    const spec = this.controlsSpec(max, (front, after) => describeChange(before, { pid: front.pid, app: { bundleId: front.bundleId, name: front.name }, elements: after.elements, cut: after.cut }));
+    return this.readAfterAction(agentId, "ui_snapshot", spec, "No state");
+  }
+
+  // afterAction marks the reads that report an action's own result: they keep the agent's own
+  // pointer placement excused (Failsafe.tripped), never change the working app (read), and never take
+  // the screen back for an agent that let go of it during the action (turn end, close).
+  private async onScreen<A>(agentId: string, mode: Mode, spec: ReadSpec<A> | ActionSpec<A>, args: A, afterAction = false): Promise<{ content: Content[]; target: string | null; observed?: Observed }> {
     const { engine, failsafe, lease } = this.options;
     const status = await engine.status();
-    if (failsafe.tripped(status.cursor)) {
+    if (failsafe.tripped(status.cursor, { keepPlacement: afterAction })) {
       await this.stopAll();
       throw new Refusal("The pointer is in the top-left corner, so computer use is now stopped; the user can resume it from the Computer panel");
     }
-    try {
-      lease.take(agentId);
-    } catch (error) {
-      if (error instanceof LeaseHeldError) throw new Refusal(`Agent ${await this.options.agentTitle(error.holder)} is using the screen`);
-      throw error;
+    if (afterAction) {
+      if (lease.holderId() !== agentId) throw new Refusal("The screen was released after this action (for example, the agent's turn ended)");
+    } else {
+      try {
+        lease.take(agentId);
+      } catch (error) {
+        if (error instanceof LeaseHeldError) throw new Refusal(`Agent ${await this.options.agentTitle(error.holder)} is using the screen`);
+        throw error;
+      }
     }
     const settings = await this.options.settings();
-    return spec.kind === "read" ? this.read(agentId, spec, args, status, settings) : this.act(agentId, mode, spec, args, settings);
+    return spec.kind === "read" ? this.read(agentId, spec, args, status, settings, afterAction) : this.act(agentId, mode, spec, args, settings);
+  }
+
+  private async statusReport(agentId: string): Promise<string> {
+    const { control, lease, engine, elements } = this.options;
+    const mode = control.mode(agentId);
+    const holder = lease.holderId();
+    let accessibility: string;
+    try {
+      accessibility = (await engine.status()).trusted ? "granted" : "missing; the user grants it to Paseo in System Settings > Privacy & Security > Accessibility, or from the Computer panel";
+    } catch (error) {
+      accessibility = `unknown (${error instanceof Error ? error.message : String(error)})`;
+    }
+    const recording = engine.screenRecording();
+    const working = lease.workingApp(agentId);
+    const table = elements.get(agentId);
+    return [
+      `Mode: ${mode === "off" ? "off; the user can turn it on with /computer ask or /computer auto" : mode === "ask" ? "ask (the user approves each input action)" : "auto (input actions run without approval)"}`,
+      control.stopped() ? "Stopped by the user; they can resume it from the Computer panel" : "Not stopped",
+      `Screen: ${holder === null ? "free" : holder === agentId ? "held by you" : `held by agent ${await this.options.agentTitle(holder)}`}`,
+      `Accessibility: ${accessibility}`,
+      `Screen Recording: ${recording === "granted" ? "granted" : recording === "missing" ? "missing; the user grants it to Paseo in System Settings > Privacy & Security > Screen Recording, then reopens Paseo" : "not checked yet; the user can check it in the Computer panel"}`,
+      `Working app: ${working ? appLabel(working) : "none; take a screenshot or ui_snapshot first"}`,
+      `Element numbers: ${table ? `${table.elements.length} controls from ${table.app.name}` : "none; call ui_snapshot"}`,
+    ].join("\n");
   }
 
   // Every tool runs through here, in this order: identity, stop, mode, rate limit, then (for tools
-  // that touch the screen) corner failsafe, lease, and the read or action path. Argument schemas are
-  // checked by the MCP server before.
+  // that touch the screen) corner failsafe, lease, and the read or action path. status skips only the
+  // stop and mode checks (InfoSpec). Argument schemas are checked by the MCP server before.
   private async call<A>(seat: string, tool: string, spec: ToolSpec<A>, args: A) {
     const { seats, calls, rates, audit } = this.options;
     let agentId: string | null = null;
@@ -303,15 +408,19 @@ export class ComputerMcp {
     try {
       agentId = seats.agentFor(seat);
       if (agentId === null) throw new Refusal(NOT_READY);
-      const mode = this.requireRunning(agentId);
+      const mode = spec.kind === "info" ? this.options.control.mode(agentId) : this.requireRunning(agentId);
       calls.take(agentId);
       if (spec.kind === "action") rates.take(agentId);
-      const result = spec.kind === "pause" ? { content: await spec.run(args), target: null } : await this.onScreen(agentId, mode, spec, args);
+      const result =
+        spec.kind === "pause" ? { content: await spec.run(args), target: null } : spec.kind === "info" ? { content: await spec.run(agentId), target: null } : await this.onScreen(agentId, mode, spec, args);
       target = result.target;
       await audit.record({ agentId, tool, target, outcome: "ok", chars });
       this.options.panel?.activity({ agentId, tool, target, outcome: "ok", chars });
-      if (spec.kind === "action" && wantsScreenshot(args)) return { content: [...result.content, ...(await this.screenshotAfterAction(agentId))] };
-      return { content: result.content };
+      if (!result.observed) return { content: result.content };
+      await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
+      const state = await this.stateAfterAction(agentId, result.observed);
+      const shot = wantsScreenshot(args) ? await this.readAfterAction(agentId, "screenshot", this.screenshotSpec, "No screenshot") : [];
+      return { content: [...result.content, ...state, ...shot] };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const outcome = error instanceof Refusal ? `refused: ${message}` : `error: ${message}`;
@@ -329,13 +438,52 @@ export class ComputerMcp {
     const register = <A>(name: (typeof TOOL_NAMES)[number], title: string, description: string, inputSchema: z.ZodRawShape, spec: ToolSpec<A>) => {
       mcp.registerTool(name, { title, description, inputSchema, annotations: { readOnlyHint: spec.kind !== "action" } }, (args: unknown) => this.call(seat, name, spec, args as A));
     };
-    const pointerAt = async (point: Point) => [await this.appAt(point)];
-    // Keyboard input goes to the front app; before approval that is meant to be the working app.
-    const keyboardReceivers = async (_args: unknown, working: AppRef | null, phase: "planned" | "actual"): Promise<AppRef[]> => {
-      if (phase === "planned") return working ? [working] : [];
-      const front = (await engine.status()).front;
-      return front ? [{ bundleId: front.bundleId, name: front.name }] : [];
+    // A point given directly, or the middle of a control from the agent's last ui_snapshot. Before
+    // acting, the control's window is read again and must still list that control under the number
+    // the user approved; the point then comes from that fresh read.
+    const pointerTarget = async (agentId: string, { x, y, element }: PointerArgs, _working: AppRef | null, planned: Target | null): Promise<Target> => {
+      if (element === undefined) {
+        if (x === undefined || y === undefined) throw new Refusal(ELEMENT_OR_POINT);
+        return { apps: [await this.appAt({ x, y })], point: { x, y }, element: null };
+      }
+      if (x !== undefined || y !== undefined) throw new Refusal(ELEMENT_OR_POINT);
+      let expected: ExpectedElement;
+      let frame: ExpectedElement["element"]["frame"];
+      let liveRead: UiSnapshot | undefined;
+      if (planned?.element) {
+        expected = planned.element;
+        // The user may have blocked the app while the action waited; a blocked app is never read.
+        this.requireInputAllowed([expected.app], await this.options.settings());
+        if ((await engine.status()).front?.pid !== expected.pid) throw new Refusal(`${expected.app.name} is no longer in front; call ui_snapshot again`);
+        liveRead = await engine.uiSnapshot(expected.pid, expected.max);
+        const live = matchLive(expected, liveRead);
+        if ("refusal" in live) throw new Refusal(live.refusal);
+        frame = live.element.frame;
+      } else {
+        const picked = pickElement(this.options.elements.get(agentId), element);
+        if ("refusal" in picked) throw new Refusal(picked.refusal);
+        expected = picked.expected;
+        frame = expected.element.frame;
+      }
+      const point = center(frame);
+      const app = await this.appAt(point);
+      if (app.bundleId !== expected.app.bundleId) throw new Refusal(`Element ${element} is not on ${expected.app.name}'s window at ${at(point)}: ${app.name} is there`);
+      return { apps: [app], point, element: expected, live: liveRead };
     };
+    // Keyboard input goes to the front app; before approval that is meant to be the working app.
+    const keyboardTarget = async (_agentId: string, _args: unknown, working: AppRef | null, planned: Target | null): Promise<Target> => {
+      if (planned === null) return { apps: working ? [working] : [], point: null, element: null };
+      const front = (await engine.status()).front;
+      return { apps: front ? [{ bundleId: front.bundleId, name: front.name }] : [], point: null, element: null };
+    };
+
+    register<Record<string, never>>(
+      "status",
+      "Status",
+      "Report whether computer use is on for you or stopped, who holds the screen, whether Paseo has the macOS permissions, and which app your input goes to. Answers even when computer use is off.",
+      {},
+      { kind: "info", run: async (agentId) => textContent(await this.statusReport(agentId)) },
+    );
 
     register("screenshot", "Screenshot", "Capture the main display. The image is at point size: a coordinate read off it is the coordinate to click.", {}, this.screenshotSpec);
 
@@ -383,32 +531,32 @@ export class ComputerMcp {
     register<{ max_elements?: number }>(
       "ui_snapshot",
       "Accessibility snapshot",
-      "List the front window's controls as text (role, label, value, frame in points), for reading the screen without images.",
+      "List the front window's controls as text (role, label, value, frame in points), for reading the screen without images. Pass a control's number as element to click, move, or scroll to act on it; the action is refused if that control changed.",
       { max_elements: z.number().int().min(1).max(LIMITS.snapshotElements).optional() },
       {
         kind: "read",
-        run: async (_agentId, { max_elements }, status) => {
-          if (!status.front) throw new Refusal("No app is in front");
-          const snapshot = await engine.uiSnapshot(status.front.pid, max_elements ?? 200);
-          const lines = snapshot.elements.map((element, i) => {
-            const label = element.label ? ` ${JSON.stringify(element.label)}` : "";
-            const value = element.value !== null ? ` value=${JSON.stringify(element.value)}` : "";
-            const frame = element.frame ? ` at ${element.frame[0]},${element.frame[1]} ${element.frame[2]}x${element.frame[3]}` : "";
-            return `${i + 1}. ${element.role ?? "unknown"}${label}${value}${frame}`;
-          });
-          const cut = snapshot.cut ? ", cut short" : "";
-          return { content: textContent([`Front window of ${appLabel(status.front)} (${lines.length} elements${cut}):`, ...lines].join("\n")) };
-        },
+        run: (agentId, { max_elements }, status, settings) =>
+          this.controlsSpec(max_elements ?? SNAPSHOT_ELEMENTS, (front, snapshot) => {
+            const lines = snapshot.elements.map((element, i) => {
+              const label = element.label ? ` ${JSON.stringify(element.label)}` : "";
+              const value = element.value !== null ? ` value=${JSON.stringify(element.value)}` : "";
+              const frame = element.frame ? ` at ${element.frame[0]},${element.frame[1]} ${element.frame[2]}x${element.frame[3]}` : "";
+              return `${i + 1}. ${element.role ?? "unknown"}${label}${value}${frame}`;
+            });
+            const cut = snapshot.cut ? ", cut short" : "";
+            return [`Front window of ${appLabel(front)} (${lines.length} elements${cut}):`, ...lines].join("\n");
+          }).run(agentId, {}, status, settings),
       },
     );
 
-    register<{ x: number; y: number; button?: MouseButton; count?: number; modifiers?: string[] }>(
+    register<PointerArgs & { button?: MouseButton; count?: number; modifiers?: string[] }>(
       "click",
       "Click",
-      "Click at a point.",
+      "Click at a point, or on a control by its number from your last ui_snapshot.",
       {
-        x: coordinate,
-        y: coordinate,
+        x: coordinate.optional(),
+        y: coordinate.optional(),
+        element: elementNumber,
         screenshot: screenshotAfter,
         button: z.enum(["left", "right", "middle"]).optional(),
         count: z.number().int().min(1).max(LIMITS.clickCount).optional().describe("2 for a double click"),
@@ -418,56 +566,69 @@ export class ComputerMcp {
         kind: "action",
         needsWorkingApp: true,
         scopable: true,
-        receivers: ({ x, y }) => pointerAt({ x, y }),
-        describe: ({ x, y, button = "left", count = 1, modifiers = [] }, [app]) =>
-          `click ${button}${count > 1 ? ` x${count}` : ""}${modifiers.length ? ` with ${modifiers.join("+")}` : ""} at ${at({ x, y })} on ${app.name}`,
-        act: ({ x, y, button = "left", count = 1, modifiers = [] }) => engine.click({ x, y }, { button, count, modifiers }),
-        after: (_agentId, { x, y }) => failsafe.notePlaced({ x, y }),
+        target: pointerTarget,
+        describe: ({ button = "left", count = 1, modifiers = [] }, target) =>
+          `click ${button}${count > 1 ? ` x${count}` : ""}${modifiers.length ? ` with ${modifiers.join("+")}` : ""} ${target.element ? "on" : "at"} ${where(target)} on ${target.apps[0].name}`,
+        act: ({ button = "left", count = 1, modifiers = [] }, target) => engine.click(pointOf(target), { button, count, modifiers }),
+        after: (_agentId, _args, target) => failsafe.notePlaced(pointOf(target)),
       },
     );
 
-    register<{ x: number; y: number }>("move", "Move", "Move the pointer to a point.", { x: coordinate, y: coordinate, screenshot: screenshotAfter }, {
-      kind: "action",
-      needsWorkingApp: true,
-      scopable: true,
-      receivers: ({ x, y }) => pointerAt({ x, y }),
-      describe: ({ x, y }, [app]) => `move the pointer to ${at({ x, y })} over ${app.name}`,
-      act: ({ x, y }) => engine.move({ x, y }),
-      after: (_agentId, { x, y }) => failsafe.notePlaced({ x, y }),
-    });
+    register<PointerArgs>(
+      "move",
+      "Move",
+      "Move the pointer to a point, or to a control by its number from your last ui_snapshot.",
+      { x: coordinate.optional(), y: coordinate.optional(), element: elementNumber, screenshot: screenshotAfter },
+      {
+        kind: "action",
+        needsWorkingApp: true,
+        scopable: true,
+        target: pointerTarget,
+        describe: (_args, target) => `move the pointer to ${where(target)} over ${target.apps[0].name}`,
+        act: (_args, target) => engine.move(pointOf(target)),
+        after: (_agentId, _args, target) => failsafe.notePlaced(pointOf(target)),
+      },
+    );
 
     register<{ from: [number, number]; to: [number, number] }>("drag", "Drag", "Press the left button at one point, move to another, and release.", { from: pair, to: pair, screenshot: screenshotAfter }, {
       kind: "action",
       needsWorkingApp: true,
       scopable: true,
-      receivers: async ({ from, to }) => [await this.appAt({ x: from[0], y: from[1] }), await this.appAt({ x: to[0], y: to[1] })],
-      describe: ({ from, to }, [start, end]) => `drag from ${at({ x: from[0], y: from[1] })} on ${start.name} to ${at({ x: to[0], y: to[1] })} on ${end.name}`,
+      target: async (_agentId, { from, to }) => ({ apps: [await this.appAt({ x: from[0], y: from[1] }), await this.appAt({ x: to[0], y: to[1] })], point: null, element: null }),
+      describe: ({ from, to }, { apps: [start, end] }) => `drag from ${at({ x: from[0], y: from[1] })} on ${start.name} to ${at({ x: to[0], y: to[1] })} on ${end.name}`,
       act: ({ from, to }) => engine.drag({ x: from[0], y: from[1] }, { x: to[0], y: to[1] }),
       after: (_agentId, { to }) => failsafe.notePlaced({ x: to[0], y: to[1] }),
     });
 
-    register<{ x: number; y: number; direction: ScrollDirection; amount?: number }>(
+    register<PointerArgs & { direction: ScrollDirection; amount?: number }>(
       "scroll",
       "Scroll",
-      "Scroll at a point by lines.",
-      { x: coordinate, y: coordinate, direction: z.enum(["up", "down", "left", "right"]), amount: z.number().int().min(1).max(LIMITS.scrollAmount).optional(), screenshot: screenshotAfter },
+      "Scroll by lines at a point, or on a control by its number from your last ui_snapshot.",
+      {
+        x: coordinate.optional(),
+        y: coordinate.optional(),
+        element: elementNumber,
+        direction: z.enum(["up", "down", "left", "right"]),
+        amount: z.number().int().min(1).max(LIMITS.scrollAmount).optional(),
+        screenshot: screenshotAfter,
+      },
       {
         kind: "action",
         needsWorkingApp: true,
         scopable: true,
-        receivers: ({ x, y }) => pointerAt({ x, y }),
-        describe: ({ x, y, direction, amount = 3 }, [app]) => `scroll ${direction} ${amount} at ${at({ x, y })} on ${app.name}`,
-        act: ({ x, y, direction, amount = 3 }) => engine.scroll({ x, y }, direction, amount),
-        after: (_agentId, { x, y }) => failsafe.notePlaced({ x, y }),
+        target: pointerTarget,
+        describe: ({ direction, amount = 3 }, target) => `scroll ${direction} ${amount} ${target.element ? "on" : "at"} ${where(target)} on ${target.apps[0].name}`,
+        act: ({ direction, amount = 3 }, target) => engine.scroll(pointOf(target), direction, amount),
+        after: (_agentId, _args, target) => failsafe.notePlaced(pointOf(target)),
       },
     );
 
     register<{ text: string }>("type", "Type", "Type text into the app you are working in.", { text: z.string().min(1).max(LIMITS.typeUnits), screenshot: screenshotAfter }, {
       kind: "action",
       needsWorkingApp: true,
-      receivers: keyboardReceivers,
+      target: keyboardTarget,
       describe: ({ text }) => `type ${shownText(text)}`,
-      act: ({ text }, [app]) => engine.type(text, receiverId(app)),
+      act: ({ text }, { apps: [app] }) => engine.type(text, receiverId(app)),
       chars: ({ text }) => text.length,
     });
 
@@ -479,23 +640,23 @@ export class ComputerMcp {
       {
         kind: "action",
         needsWorkingApp: true,
-        receivers: keyboardReceivers,
+        target: keyboardTarget,
         describe: ({ keys, repeat = 1 }) => `press ${keys}${repeat > 1 ? ` x${repeat}` : ""}`,
-        act: ({ keys, repeat = 1 }, [app]) => engine.key(keys, repeat, receiverId(app)),
+        act: ({ keys, repeat = 1 }, { apps: [app] }) => engine.key(keys, repeat, receiverId(app)),
       },
     );
 
     register<{ name: string }>("open_app", "Open app", "Open or switch to an app by name; it becomes the app you are working in.", { name: z.string().min(1).max(200), screenshot: screenshotAfter }, {
       kind: "action",
       needsWorkingApp: false,
-      receivers: async ({ name }) => {
+      target: async (_agentId, { name }) => {
         const app = await engine.resolveApp(name);
         if (app === null) throw new Refusal(`No app named ${JSON.stringify(name)}`);
-        return [{ bundleId: app.bundleId, name }];
+        return { apps: [{ bundleId: app.bundleId, name }], point: null, element: null };
       },
-      describe: (_args, [app]) => `open ${appLabel(app)}`,
-      act: async (_args, [app]) => engine.openApp(app.bundleId as string),
-      after: (agentId, _args, [app]) => lease.setWorkingApp(agentId, app),
+      describe: (_args, { apps: [app] }) => `open ${appLabel(app)}`,
+      act: async (_args, { apps: [app] }) => engine.openApp(app.bundleId as string),
+      after: (agentId, _args, { apps: [app] }) => lease.setWorkingApp(agentId, app),
     });
 
     return mcp;

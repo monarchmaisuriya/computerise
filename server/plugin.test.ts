@@ -11,7 +11,7 @@ import { tempDir } from "./test-temp-dir";
 type Handler = (...args: never[]) => unknown;
 type Row = { agentId: string; row: Record<string, any> };
 
-const TOOLS = ["click", "cursor_position", "drag", "key", "move", "open_app", "screenshot", "scroll", "type", "ui_snapshot", "wait", "zoom"];
+const TOOLS = ["click", "cursor_position", "drag", "key", "move", "open_app", "screenshot", "scroll", "status", "type", "ui_snapshot", "wait", "zoom"];
 const other = { excalidraw: { type: "stdio", command: "excalidraw" } };
 const otherApproval = { kind: "mcp", server: "excalidraw", tool: "draw" };
 
@@ -179,6 +179,22 @@ describe("computerise server entry", () => {
     expect((await callTool(clientY, "screenshot")).isError).toBe(false);
   });
 
+  it.each([
+    ["forgets", "the agent closes", (fake: ReturnType<typeof start>) => fake.closed("agent-x"), true],
+    ["forgets", "the mode changes", (fake: ReturnType<typeof start>) => fake.call("computer.mode.set", { agentId: "agent-x", mode: "auto" }), true],
+    ["keeps", "the turn ends", (fake: ReturnType<typeof start>) => fake.turnEnded("agent-x"), false],
+  ])("%s element numbers when %s", async (_verb, _event, happen, forgotten) => {
+    const fake = start();
+    const x = await createAgent(fake, "agent-x");
+    await fake.call("computer.mode.set", { agentId: "agent-x", mode: "auto" });
+    const client = await connect(x);
+    await callTool(client, "ui_snapshot");
+    await happen(fake);
+    await callTool(client, "screenshot");
+    const click = await callTool(client, "click", { element: 1 });
+    expect(click.text.split("\n")[0]).toBe(forgotten ? "No element numbers yet: call ui_snapshot first" : "Done: click left on element 1 (AXTextArea) at (160, 220) on TextEdit");
+  });
+
   it("revokes an archived agent's token and saved mode", async () => {
     const fake = start();
     const created = await createAgent(fake, "agent-x");
@@ -206,7 +222,7 @@ describe("computerise server entry", () => {
     await expect(fake.call("computer.approval.answer", { requestId: row.data.requestId, agentId: "agent-y", allow: true })).rejects.toThrow("belongs to another agent");
     await fake.call("computer.approval.answer", { requestId: row.data.requestId, agentId: "agent-x", allow: true });
     expect((await pending).isError).toBe(false);
-    expect(fake.mac.effects().map((effect) => effect.method)).toEqual(["screenshot", "type"]);
+    expect(fake.mac.effects().map((effect) => effect.method)).toEqual(["screenshot", "uiSnapshot", "type", "uiSnapshot"]);
   });
 
   it("reports and changes modes and the global stop through RPCs", async () => {
@@ -237,6 +253,7 @@ describe("computerise server entry", () => {
     expect(JSON.stringify(status)).not.toContain("anBlZw==");
     expect(await fake.call("computer.panel.screenshot", { id: status.screenshot.id })).toEqual({ id: status.screenshot.id, jpegBase64: "anBlZw==" });
     expect(status.recent).toEqual([
+      expect.objectContaining({ agentId: "agent-x", tool: "ui_snapshot", outcome: "ok" }),
       expect.objectContaining({ agentId: "agent-x", tool: "type", outcome: "ok", chars: 11 }),
       expect.objectContaining({ agentId: "agent-x", tool: "screenshot", outcome: "ok" }),
     ]);
@@ -282,6 +299,19 @@ describe("computerise server entry", () => {
     expect(await fake.call("computer.panel.health", {})).toEqual({ accessibility: "missing", screenRecording: "missing", engineError: null });
     fake.mac.screen.statusError = "The status script failed: The script host exited (code 1)";
     expect(await fake.call("computer.panel.health", {})).toEqual({ accessibility: null, screenRecording: "missing", engineError: "The status script failed: The script host exited (code 1)" });
+  });
+
+  it.each([
+    ["open-accessibility-settings", ["openPrivacySettings", "accessibility"]],
+    ["open-screen-recording-settings", ["openPrivacySettings", "screen-recording"]],
+    ["ask-macos-for-accessibility", ["promptAccessibility"]],
+    ["check-screen-recording", ["checkScreenRecording"]],
+  ])("runs the panel's %s permission action and answers with fresh health", async (action, expected) => {
+    const fake = start();
+    const permissionCalls = () => fake.mac.calls.filter((entry) => ["openPrivacySettings", "promptAccessibility", "checkScreenRecording"].includes(entry.method)).map((entry) => [entry.method, ...entry.args]);
+    const health = await fake.call("computer.permission.act", { action });
+    expect(permissionCalls()).toEqual([expected]);
+    expect(health).toEqual({ accessibility: "granted", screenRecording: action === "check-screen-recording" ? "granted" : "unknown", engineError: null });
   });
 
   it("answers panel status, including Stop, while the engine is busy", async () => {

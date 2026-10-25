@@ -141,6 +141,17 @@ describe("the corner failsafe", () => {
     failsafe.notePlaced({ x: 400, y: 300 });
     expect(failsafe.tripped({ x: 0, y: 1 })).toBe(true);
   });
+
+  // The reads that report an action's own result run before the agent's next call, which is the one
+  // check the agent's own placement excuses; parking the pointer in the corner still stops it.
+  it("lets the reads after an action see the agent's own placement without using up its excuse", () => {
+    const failsafe = new Failsafe();
+    failsafe.notePlaced({ x: 0, y: 0 });
+    expect(failsafe.tripped({ x: 0, y: 0 }, { keepPlacement: true })).toBe(false);
+    expect(failsafe.tripped({ x: 0, y: 0 }, { keepPlacement: true })).toBe(false);
+    expect(failsafe.tripped({ x: 0, y: 0 })).toBe(false);
+    expect(failsafe.tripped({ x: 0, y: 0 })).toBe(true);
+  });
 });
 
 describe("modes and the global stop", () => {

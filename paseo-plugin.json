@@ -1,0 +1,10 @@
+{
+  "id": "computerise",
+  "name": "Computerise",
+  "icon": "computerise.png",
+  "description": "Desktop computer use for any Paseo agent, off until you turn it on per agent.",
+  "requirements": {
+    "paseo": ">=0.13.0 <0.14.0"
+  },
+  "build": [["npm", "ci", "--omit=dev", "--ignore-scripts"]]
+}

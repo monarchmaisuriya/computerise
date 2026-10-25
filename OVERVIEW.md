@@ -2,8 +2,6 @@
 
 Computerise lets Paseo agents see and control the main display of the Mac running the Paseo daemon. It works across agent providers through twelve MCP tools for screenshots, accessibility snapshots, pointer position, clicking, moving, dragging, scrolling, typing, key presses, zooming, opening apps, and short waits. Any input action can also return a screenshot taken just after it.
 
-Version 0.3.1 fixes the review findings in 0.3.0: the screenshot an action returns passes every safety check, typing stops if another app comes to the front, Stop interrupts the running step, approvals end with the turn, and front-app-only screenshots use a capture method that no longer blocks. Version 0.3.0 runs every macOS step through one long-lived engine process, adds the pointer position and wait tools, an optional front-app-only screenshot, per-app approval for pointer actions, and permission health in the Computer panel. Existing settings keep working; new settings start at their previous behavior.
-
 Computer use is off for every agent by default. Choose **Ask before actions** to approve each input action in the agent chat, or **Automatic** to let that agent act without individual approvals. In ask mode, **Allow <app> this turn** on a click, move, drag, or scroll also allows later pointer actions in that app until the agent's turn ends, the agent closes, its mode changes, or computer use is stopped. Typing, key presses, opening apps, and drags between two apps always ask. A request still waiting when the turn ends, the agent closes, or its mode changes is withdrawn and does nothing. Read-only screenshots and accessibility snapshots do not ask again after computer use is enabled. One agent holds the screen at a time, and **Stop computer use** immediately cancels pending approvals, releases that lease, and interrupts the macOS step that is running, such as a long piece of typing.
 
 ## Setup
@@ -14,7 +12,7 @@ New agents receive the computer tools when they are created. Agents created befo
 
 ## Safety and data
 
-- Screenshots and accessibility snapshots are returned to the agent and are therefore sent to that agent's model provider. The Computer panel also shows the latest screenshot in the connected Paseo app. The screenshot is held only in plugin memory and is not written to disk; the panel downloads it only when a new one is taken.
+- Screenshots and accessibility snapshots are returned to the agent and are therefore sent to that agent's model provider. The Computer panel also shows the latest screenshot in the connected Paseo app. Each capture is written to a temporary file in the plugin's private folder and deleted as soon as it is read; after that, the latest screenshot is held only in plugin memory, and the panel downloads it only when a new one is taken.
 - With **Show agents only the front app** on, screenshots and zooms contain only the front app's windows at their real positions; everything else, including the menu bar and Dock, is black. If macOS returns none of the app's windows, the capture fails rather than falling back to the full display.
 - Computer use weakens an agent provider's filesystem or command sandbox because an agent can operate signed-in desktop applications with your macOS user permissions.
 - Ask mode helps prevent mistakes and actions caused by instructions embedded in pages, email, or documents. It is not a security boundary against a hostile agent that can already run arbitrary local commands.

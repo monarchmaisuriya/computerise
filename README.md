@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="computerise.png" width="160" alt="Computerise logo">
-</p>
+<img src="computerise.png" width="160" alt="Computerise logo">
 
 # Computerise
 

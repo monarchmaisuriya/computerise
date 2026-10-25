@@ -1,25 +1,32 @@
 import { type PluginWorkspacePanelProps, usePaseo, useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Image, Pressable, ScrollView, Text, View } from "react-native";
-import { answerApprovalRpc, panelStatusRpc, setModeRpc, setStopRpc, type Mode } from "../shared/contracts";
+import { answerApprovalRpc, type ApprovalScope, panelScreenshotRpc, panelStatusRpc, type ScreenRecording, setModeRpc, setStopRpc, type Mode } from "../shared/contracts";
 import { errorText } from "./errors";
 
 function modeLabel(mode: Mode): string {
   return mode === "off" ? "Off" : mode === "ask" ? "Ask before actions" : "Automatic";
 }
 
+function screenRecordingLabel(state: ScreenRecording): string {
+  return state === "granted" ? "granted" : state === "missing" ? "missing: grant it to Paseo, then reopen Paseo" : "not checked until the first screenshot";
+}
+
 export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePanelProps) {
   const paseo = usePaseo();
   const status = useRpc(panelStatusRpc);
+  const image = useRpc(panelScreenshotRpc);
   const setMode = useRpc(setModeRpc);
   const setStop = useRpc(setStopRpc);
   const answer = useRpc(answerApprovalRpc);
   const queryClient = useQueryClient();
   const query = useQuery({ queryKey: ["computerise-panel"], queryFn: () => status({}), refetchInterval: 2_000 });
+  const shotId = query.data?.screenshot?.id ?? null;
+  const shotQuery = useQuery({ queryKey: ["computerise-panel-shot", shotId], queryFn: () => image({ id: shotId as string }), enabled: shotId !== null, staleTime: Infinity });
   const agentQuery = useQuery({ queryKey: ["computerise-panel-agents", workspaceId], queryFn: () => paseo.agents.list({ page: { limit: 200 } }) });
   const refresh = () => void queryClient.invalidateQueries({ queryKey: ["computerise-panel"] });
   const stop = useMutation({ mutationFn: (stopped: boolean) => setStop({ stopped }), onSuccess: refresh });
-  const decide = useMutation({ mutationFn: ({ requestId, agentId, allow }: { requestId: string; agentId: string; allow: boolean }) => answer({ requestId, agentId, allow }), onSuccess: refresh });
+  const decide = useMutation({ mutationFn: (input: { requestId: string; agentId: string; allow: boolean; scope: ApprovalScope }) => answer(input), onSuccess: refresh });
   const change = useMutation({ mutationFn: ({ agentId, mode }: { agentId: string; mode: Mode }) => setMode({ agentId, mode }), onSuccess: refresh });
   const styles = {
     screen: { flex: 1, backgroundColor: theme.colors.surface0 } as const,
@@ -45,6 +52,12 @@ export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePan
       <View style={styles.card}>
         <Text style={styles.heading}>{data.stopped ? "Stopped" : "Ready"}</Text>
         <Text style={styles.muted}>{data.holder ? `Screen lease: ${data.holder}` : "No agent is using the screen"}</Text>
+        {data.health.engineError ? (
+          <Text style={{ color: theme.colors.statusDanger }}>Engine: {data.health.engineError}</Text>
+        ) : (
+          <Text style={data.health.accessibility === "missing" ? { color: theme.colors.statusWarning } : styles.muted}>Accessibility: {data.health.accessibility === "missing" ? "missing: grant it to Paseo" : "granted"}</Text>
+        )}
+        <Text style={data.health.screenRecording === "missing" ? { color: theme.colors.statusWarning } : styles.muted}>Screen Recording: {screenRecordingLabel(data.health.screenRecording)}</Text>
         <View style={styles.row}>
           {data.stopped ? button("Resume computer use", () => stop.mutate(false), true, stop.isPending) : button("Stop all computer use", () => stop.mutate(true), true, stop.isPending)}
           {button("Refresh", () => void query.refetch(), false, query.isFetching)}
@@ -73,7 +86,11 @@ export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePan
           <View key={pending.requestId} style={{ gap: 6 }}>
             <Text style={styles.text}>{pending.action}</Text>
             <Text style={styles.muted}>{pending.app} · {pending.agentId}</Text>
-            <View style={styles.row}>{button("Allow", () => decide.mutate({ requestId: pending.requestId, agentId: pending.agentId, allow: true }), true, decide.isPending)}{button("Deny", () => decide.mutate({ requestId: pending.requestId, agentId: pending.agentId, allow: false }), false, decide.isPending)}</View>
+            <View style={styles.row}>
+              {button("Allow", () => decide.mutate({ requestId: pending.requestId, agentId: pending.agentId, allow: true, scope: "once" }), true, decide.isPending)}
+              {pending.appScope !== null && button(`Allow ${pending.appScope} this turn`, () => decide.mutate({ requestId: pending.requestId, agentId: pending.agentId, allow: true, scope: "app-for-turn" }), false, decide.isPending)}
+              {button("Deny", () => decide.mutate({ requestId: pending.requestId, agentId: pending.agentId, allow: false, scope: "once" }), false, decide.isPending)}
+            </View>
           </View>
         ))}
       </View>
@@ -82,7 +99,11 @@ export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePan
         <Text style={styles.heading}>Last screenshot</Text>
         {data.screenshot ? (
           <>
-            <Image accessibilityLabel="Last computer screenshot" resizeMode="contain" source={{ uri: `data:image/jpeg;base64,${data.screenshot.jpegBase64}` }} style={{ width: "100%", aspectRatio: data.screenshot.width / data.screenshot.height, backgroundColor: theme.colors.surface2, borderRadius: 8 }} />
+            {shotQuery.data?.id === data.screenshot.id ? (
+              <Image accessibilityLabel="Last computer screenshot" resizeMode="contain" source={{ uri: `data:image/jpeg;base64,${shotQuery.data.jpegBase64}` }} style={{ width: "100%", aspectRatio: data.screenshot.width / data.screenshot.height, backgroundColor: theme.colors.surface2, borderRadius: 8 }} />
+            ) : (
+              <Text style={shotQuery.error ? { color: theme.colors.statusWarning } : styles.muted}>{shotQuery.error ? errorText(shotQuery.error) : "Loading screenshot"}</Text>
+            )}
             <Text style={styles.muted}>{data.screenshot.width} × {data.screenshot.height} · {data.screenshot.agentId}</Text>
           </>
         ) : <Text style={styles.muted}>No agent has taken a screenshot yet.</Text>}

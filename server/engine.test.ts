@@ -23,7 +23,7 @@ function scriptInput(call: Call): Record<string, unknown> {
 }
 
 // A stand-in for execFile that records every call and answers each script like macOS would.
-function fakeMac(options: { trusted?: boolean; cursorAfter?: (input: Record<string, unknown>) => { x: number; y: number } } = {}) {
+function fakeMac(options: { trusted?: boolean; cursorAfter?: (input: Record<string, unknown>) => { x: number; y: number }; composed?: { drawn: number; windows: number } } = {}) {
   const calls: Call[] = [];
   const run: RunFile = async (file, args) => {
     calls.push({ file, args });
@@ -46,6 +46,9 @@ function fakeMac(options: { trusted?: boolean; cursorAfter?: (input: Record<stri
       }
       case "keyboard":
         return JSON.stringify({ posted: true });
+      case "compose":
+        await writeFile(input.out, "composed-jpeg");
+        return JSON.stringify(options.composed ?? { drawn: 1, windows: 1 });
       default:
         throw new Error(`fakeMac has no answer for ${scriptName(args)}`);
     }
@@ -184,6 +187,47 @@ describe("capturing the screen", () => {
     await expect(engine.zoom([300, 100, 100, 200])).rejects.toThrow("Expected a region [x0, y0, x1, y1] with x0 < x1 and y0 < y1");
     await expect(engine.zoom([0, 0, 1513, 10])).rejects.toThrow("outside the main display");
     await expect(engine.zoom([0.5, 0, 10, 10])).rejects.toThrow("Expected whole-point region coordinates");
+  });
+
+  it("shows only one app's windows, at their screen positions, when given its process id", async () => {
+    const mac = fakeMac();
+    const engine = engineOn(mac);
+    const shot = await engine.screenshot(42);
+    expect(shot).toEqual({ jpeg: Buffer.from("composed-jpeg"), width: 1512, height: 982 });
+    const composed = mac.calls.filter((call) => call.file === "osascript" && scriptName(call.args) === "compose").map(scriptInput);
+    expect(composed).toEqual([{ pid: 42, region: [0, 0, 1512, 982], scale: 1, out: expect.any(String) }]);
+    expect(existsSync(composed[0].out as string)).toBe(false);
+    expect(mac.calls.some((call) => call.file === "screencapture" || call.file === "sips")).toBe(false);
+
+    const zoomed = await engine.zoom([100, 100, 300, 200], 42);
+    expect(zoomed).toEqual({ jpeg: Buffer.from("composed-jpeg"), width: 400, height: 200 });
+    expect(scriptInput(mac.calls.filter((call) => call.file === "osascript" && scriptName(call.args) === "compose")[1])).toMatchObject({ pid: 42, region: [100, 100, 300, 200], scale: 2 });
+  });
+
+  it("never falls back to the full display when one app's windows cannot be drawn", async () => {
+    const blank = engineOn(fakeMac({ composed: { drawn: 0, windows: 2 } }));
+    await expect(blank.screenshot(42)).rejects.toThrow("Paseo needs Screen Recording");
+    expect(blank.screenRecording()).toBe("missing");
+    const windowless = fakeMac({ composed: { drawn: 0, windows: 0 } });
+    await expect(engineOn(windowless).screenshot(42)).rejects.toThrow("The front app has no windows on screen to show");
+    expect(windowless.calls.some((call) => call.file === "screencapture")).toBe(false);
+  });
+
+  it("remembers whether the last capture showed Screen Recording granted or missing", async () => {
+    const mac = fakeMac();
+    const engine = engineOn(mac);
+    expect(engine.screenRecording()).toBe("unknown");
+    await engine.screenshot();
+    expect(engine.screenRecording()).toBe("granted");
+    const denied = new MacEngine({
+      run: async (file, args, timeoutMs) => {
+        if (file === "screencapture") throw Object.assign(new Error("failed"), { stderr: "could not create image from display" });
+        return mac.run(file, args, timeoutMs);
+      },
+      scratchDir: tempDir("computerise-deny-"),
+    });
+    await expect(denied.screenshot()).rejects.toThrow("Paseo needs Screen Recording");
+    expect(denied.screenRecording()).toBe("missing");
   });
 
   it("names the Screen Recording permission when macOS refuses the capture", async () => {

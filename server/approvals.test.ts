@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApprovalRow } from "../shared/contracts";
-import { Approvals } from "./approvals";
+import { Approvals, ApprovalScopes } from "./approvals";
 
 function fakeRows() {
   const shown: { agentId: string; rowId: string; row: ApprovalRow }[] = [];
@@ -143,5 +143,44 @@ describe("approvals", () => {
   it("fails the request when the row cannot be shown, since the user could not answer it", async () => {
     const approvals = new Approvals({ show: async () => Promise.reject(new Error("timeline closed")) }, async () => 45_000);
     await expect(approvals.request("agent-x", "click", "TextEdit")).rejects.toThrow("Could not ask the user: timeline closed");
+  });
+
+  it("offers Allow for the whole app only on rows that name one, and only as an Allow", async () => {
+    const rows = fakeRows();
+    const approvals = new Approvals(rows.rows, async () => 45_000);
+    const scoped = approvals.request("agent-x", "click left at (400, 220) on TextEdit", "TextEdit", "TextEdit");
+    await settle();
+    const row = rows.latest().row;
+    expect(row.appScope).toBe("TextEdit");
+    expect(() => approvals.answer(row.requestId, "agent-x", false, "app-for-turn")).toThrow("Only Allow can cover the whole app");
+    approvals.answer(row.requestId, "agent-x", true, "app-for-turn");
+    expect(await scoped).toBe("allow-app");
+
+    const unscoped = approvals.request("agent-x", "type 5 characters", "TextEdit");
+    await settle();
+    expect(rows.latest().row.appScope).toBeNull();
+    expect(() => approvals.answer(rows.latest().row.requestId, "agent-x", true, "app-for-turn")).toThrow("always asks");
+    approvals.answer(rows.latest().row.requestId, "agent-x", false);
+    expect(await unscoped).toBe("deny");
+  });
+});
+
+describe("apps allowed for the rest of a turn", () => {
+  it("covers an action only when every receiving app is allowed for that agent", () => {
+    const scopes = new ApprovalScopes();
+    const textEdit = { bundleId: "com.apple.TextEdit", name: "TextEdit" };
+    const notes = { bundleId: "com.apple.Notes", name: "Notes" };
+    scopes.allow("agent-x", "com.apple.TextEdit");
+    expect(scopes.covers("agent-x", [textEdit])).toBe(true);
+    expect(scopes.covers("agent-x", [textEdit, notes])).toBe(false);
+    expect(scopes.covers("agent-y", [textEdit])).toBe(false);
+    expect(scopes.covers("agent-x", [])).toBe(false);
+    expect(scopes.covers("agent-x", [{ bundleId: null, name: "Unknown" }])).toBe(false);
+    scopes.clear("agent-x");
+    expect(scopes.covers("agent-x", [textEdit])).toBe(false);
+    scopes.allow("agent-x", "com.apple.TextEdit");
+    scopes.allow("agent-y", "com.apple.TextEdit");
+    scopes.clearAll();
+    expect(scopes.covers("agent-y", [textEdit])).toBe(false);
   });
 });

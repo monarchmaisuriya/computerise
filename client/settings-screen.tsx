@@ -1,5 +1,5 @@
 import { type PluginSurfaceProps, useSettings } from "@getpaseo/plugin/client";
-import { SettingsAction, SettingsCard, SettingsInput, SettingsSection } from "@getpaseo/plugin/client/ui";
+import { SettingsAction, SettingsCard, SettingsInput, SettingsSection, SettingsSwitch } from "@getpaseo/plugin/client/ui";
 import { useState } from "react";
 import { Text } from "react-native";
 import { computerSettings, type Settings } from "../shared/contracts";
@@ -44,6 +44,17 @@ export function ComputerSettingsScreen({ theme }: PluginSurfaceProps) {
       <SettingsSection title="Approvals">
         <SettingsCard>
           <SettingsInput label="Wait for an answer (seconds)" hint="From 5 to 55. Default 45. An unanswered action does nothing." initialValue={String(settings.values.approvalTimeoutSeconds)} disabled={settings.saving} onChangeText={setTimeoutDraft} />
+        </SettingsCard>
+      </SettingsSection>
+      <SettingsSection title="Privacy">
+        <SettingsCard>
+          <SettingsSwitch
+            label="Show agents only the front app"
+            hint="Screenshots and zooms show only the windows of the app in front; the rest of the screen is black. Off shows the whole main display."
+            value={settings.values.screenshotScope === "front-app"}
+            disabled={settings.saving}
+            onValueChange={(on) => save({ ...settings.values, screenshotScope: on ? "front-app" : "display" })}
+          />
         </SettingsCard>
       </SettingsSection>
       <SettingsSection title="Blocked apps" info="Paseo, terminals, code-running apps, System Settings, and password managers are always blocked. Password managers are hidden from screenshots as well as input.">

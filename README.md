@@ -4,20 +4,24 @@
 
 Computer use for any Paseo agent on macOS. Computerise gives Claude, Codex, OpenCode, and other MCP-capable agents tools to see and control the Mac running the Paseo daemon.
 
-Current release: **v0.2.0**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
+Current release: **v0.3.0**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
 
 ## What it provides
 
-- Screenshots and zoomed regions
+- Screenshots and zoomed regions, optionally showing only the front app's windows
 - Text accessibility snapshots for models that cannot consume images
 - Mouse clicks, movement, dragging, and scrolling
 - Keyboard input and shortcuts
 - App opening and foreground restoration
+- Pointer position and short waits
+- An optional screenshot returned with any input action (`screenshot: true`)
+- One long-lived engine process, so each step takes milliseconds instead of a new process
 - Per-agent `off`, `ask`, and `auto` modes
-- Allow and Deny cards in agent chats
+- Allow and Deny cards in agent chats, plus "Allow <app> this turn" for pointer actions
 - A one-agent-at-a-time screen lease
 - Mandatory built-in blocks for Paseo, terminals, code-running apps, System Settings, and password managers
 - Global Stop and Resume controls
+- Accessibility, Screen Recording, and engine health in the Computer panel
 - Audit logging that records typed character counts, never typed text
 
 ## Requirements
@@ -40,7 +44,7 @@ In an agent composer:
 /computer status
 ```
 
-The composer pill and the **Computer** workspace panel provide the same controls. Ask mode requires approval for every input action; read-only screenshots and accessibility snapshots do not ask again after access is enabled.
+The composer pill and the **Computer** workspace panel provide the same controls. Ask mode requires approval for every input action; read-only screenshots and accessibility snapshots do not ask again after access is enabled. For clicks, moves, drags, and scrolls, **Allow <app> this turn** also allows later pointer actions in that same app until the agent's turn ends; typing, key presses, and opening apps always ask.
 
 ## Security model
 
@@ -48,7 +52,7 @@ Computer use is off by default. Screenshots and accessibility snapshots are retu
 
 Ask mode helps prevent mistakes and prompt-injected actions, but it is not a security boundary against an already-hostile agent with arbitrary local command access. See [OVERVIEW.md](OVERVIEW.md) for the complete safety and data notes.
 
-Screenshots capture the full main display. Computerise refuses capture when a password manager is frontmost, but it does not redact other visible windows behind the front app.
+Screenshots capture the full main display by default. Turn on **Show agents only the front app** in the plugin settings to send only the front app's windows, at their real positions, with the rest of the screen black. Computerise refuses capture when a password manager is frontmost.
 
 ## Development
 
@@ -56,6 +60,7 @@ Screenshots capture the full main display. Computerise refuses capture when a pa
 npm install
 npm test
 npm run typecheck
+npm run test:live   # switches the front app to TextEdit and back on this Mac
 ```
 
 The project has separate client, server, and shared runtime boundaries:

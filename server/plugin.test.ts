@@ -11,7 +11,7 @@ import { tempDir } from "./test-temp-dir";
 type Handler = (...args: never[]) => unknown;
 type Row = { agentId: string; row: Record<string, any> };
 
-const TOOLS = ["click", "drag", "key", "move", "open_app", "screenshot", "scroll", "type", "ui_snapshot", "zoom"];
+const TOOLS = ["click", "cursor_position", "drag", "key", "move", "open_app", "screenshot", "scroll", "type", "ui_snapshot", "wait", "zoom"];
 const other = { excalidraw: { type: "stdio", command: "excalidraw" } };
 const otherApproval = { kind: "mcp", server: "excalidraw", tool: "draw" };
 
@@ -233,11 +233,54 @@ describe("computerise server entry", () => {
     await callTool(client, "type", { text: "secret text" });
 
     const status = await fake.call("computer.panel.status", {});
-    expect(status.screenshot).toMatchObject({ agentId: "agent-x", jpegBase64: "anBlZw==", width: 1512, height: 982 });
+    expect(status.screenshot).toMatchObject({ agentId: "agent-x", width: 1512, height: 982 });
+    expect(JSON.stringify(status)).not.toContain("anBlZw==");
+    expect(await fake.call("computer.panel.screenshot", { id: status.screenshot.id })).toEqual({ id: status.screenshot.id, jpegBase64: "anBlZw==" });
     expect(status.recent).toEqual([
       expect.objectContaining({ agentId: "agent-x", tool: "type", outcome: "ok", chars: 11 }),
       expect.objectContaining({ agentId: "agent-x", tool: "screenshot", outcome: "ok" }),
     ]);
     expect(JSON.stringify(status)).not.toContain("secret text");
+  });
+
+  it.each([
+    ["the turn ends", (fake: ReturnType<typeof start>) => fake.turnEnded("agent-x")],
+    ["the agent closes", (fake: ReturnType<typeof start>) => fake.closed("agent-x")],
+    ["the mode changes", (fake: ReturnType<typeof start>) => fake.call("computer.mode.set", { agentId: "agent-x", mode: "ask" })],
+  ])("asks again for an app allowed for the turn once %s", async (_event, happen) => {
+    const fake = start();
+    const x = await createAgent(fake, "agent-x");
+    await fake.call("computer.mode.set", { agentId: "agent-x", mode: "ask" });
+    const client = await connect(x);
+    const pendingRows = () => fake.appended.filter(({ row }) => row.data.status === "pending");
+    const answerLatest = async (allow: boolean, scope?: string) => {
+      for (let i = 0; i < 200 && pendingRows().length === answered; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+      const { row } = pendingRows()[answered];
+      answered += 1;
+      await fake.call("computer.approval.answer", { requestId: row.data.requestId, agentId: "agent-x", allow, ...(scope ? { scope } : {}) });
+    };
+    let answered = 0;
+    await callTool(client, "screenshot");
+    const first = callTool(client, "click", { x: 400, y: 220 });
+    await answerLatest(true, "app-for-turn");
+    expect((await first).isError).toBe(false);
+    expect((await callTool(client, "click", { x: 400, y: 220 })).isError).toBe(false);
+    expect(pendingRows()).toHaveLength(1);
+
+    await happen(fake);
+    await callTool(client, "screenshot");
+    const after = callTool(client, "click", { x: 400, y: 220 });
+    await answerLatest(false);
+    expect((await after).text).toContain("The user denied this action");
+  });
+
+  it("reports Accessibility, Screen Recording, and engine failures as panel health", async () => {
+    const fake = start();
+    expect((await fake.call("computer.panel.status", {})).health).toEqual({ accessibility: "granted", screenRecording: "unknown", engineError: null });
+    fake.mac.screen.trusted = false;
+    fake.mac.screen.screenRecording = "missing";
+    expect((await fake.call("computer.panel.status", {})).health).toEqual({ accessibility: "missing", screenRecording: "missing", engineError: null });
+    fake.mac.screen.statusError = "The status script failed: The script host exited (code 1)";
+    expect((await fake.call("computer.panel.status", {})).health).toEqual({ accessibility: null, screenRecording: "missing", engineError: "The status script failed: The script host exited (code 1)" });
   });
 });

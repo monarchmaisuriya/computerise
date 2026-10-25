@@ -1,57 +1,52 @@
-# Review: code: Computerise v0.2.0
+# Review: code: Computerise v0.3.0
 
 ## At a glance
 
 - **Bottom line:** ship as is
-- **Where we are:** reviewed the complete plugin, its tests, package, runtime installation, provider smoke tests, and SemVer compatibility; complete; waiting on nothing
+- **Where we are:** reviewed the v0.3.0 change (long-lived engine host, new tools, front-app capture, per-app approval, panel health) with its tests, live checks, and provider smoke tests; complete; waiting on nothing
 - **Need from M:** nothing
-- **Why:** eleven structural findings were fixed at their owning layers, including persistence fail-open behavior, read privacy races, stale approvals, archive revocation, execution-time safety rechecks, dependency advisories, and settings migration
-- **Intended outcome:** a safe-by-default macOS computer-use plugin whose v0.2.0 release accurately communicates its compatibility and security contract
+- **Why:** six structural defects found during the build and the live provider tests were fixed at their owners before release, each with a test or live run that failed first
+- **Intended outcome:** a faster engine and new controls that keep every v0.2.0 safety check in the same pipeline
 - **Findings:** 0 blocking, 0 must-verify, 0 notes after fixes
+- **Live provider tests (2026-10-25, macOS 26.7.1):** Claude (Sonnet 5.5), Codex (GPT-6-Luna), and OpenCode (Claude Sonnet 5) each ran cursor_position, open_app with a returned screenshot, wait, type, and ui_snapshot with no tool errors or timeouts; OpenCode also ran with front-app-only screenshots, and the image it received showed only TextEdit's windows on black. TextEdit's own autocorrect changed some typed words ("opencode" to "open code"); the posted keystrokes were exact.
 
 ## Findings fixed
 
-1. Control and seat stores no longer expose enabling state before durable writes succeed; safer Off, Stop, and revocation transitions remain effective even when persistence fails.
-2. Screenshot and accessibility reads re-check the foreground app after capture and drop results when the screen changed or a no-view app appeared.
-3. Every action re-checks Stop, mode, the corner failsafe, current settings, and the actual target immediately before engine execution.
-4. A plugin-created move to the top-left corner exempts only the next check rather than disabling the emergency stop indefinitely.
-5. Approval timeouts start after the row is visible, and final states are sequenced after the initial append so a slow pending row cannot overwrite cancellation.
-6. Typed text never enters audit or panel history, including when an engine error echoes the text.
-7. Read and action calls are rate-limited per agent; action calls retain the tighter limit.
-8. Existing token-secret and data-directory permissions are repaired to `0600` and `0700`.
-9. Archiving revokes seats, saved modes, leases, and rate state.
-10. Built-in safety blocks are mandatory; version-1 settings migrate to version 2 and drop the removed escape hatch.
-11. Vitest was upgraded from 3.2.7 to 4.1.12, removing all reported dependency advisories.
+1. **A long-lived host reported a stale front app.** Without running its event loop, the host kept answering with the app that was in front earlier, which every blocklist and screen-change check reads. The host now pumps the run loop before every request. Proven by a live test that compares the host with a fresh process across an app switch; removing the pump makes it fail.
+2. **A short request could kill a long one.** Deadlines started when a request was queued, so the panel's 2-second status poll waiting behind 20 seconds of typing would time out and kill the host mid-typing. Requests are now sent one at a time and each deadline starts when its request is sent.
+3. **Screenshots returned with an action were not audited.** They are now audited and shown in panel history as their own screenshot entries.
+4. **The host printed a stray empty line when its input closed.** It now ends silently, and a test proves it exits by itself, so it never outlives the plugin process.
+5. **Anthropic's API rejected two tool definitions.** `zoom` and `drag` used tuple schemas, which the SDK writes in draft-07 form; Anthropic validates against JSON Schema draft 2020-12, so an OpenCode agent on an Anthropic model failed every request (`tools.15.custom.input_schema: JSON schema is invalid`). This predates v0.3.0. Both now use fixed-length arrays with the same arguments on the wire, and a test validates every tool schema against the 2020-12 meta-schema. A fresh OpenCode agent on Claude Sonnet 5 then passed.
+6. **The prompt note made a model assume the tools were off.** "They are refused until the user turns computer use on" led Codex to answer without calling any tool, although its mode was Automatic (zero audit lines). The note now says to call the tools and react to the refusal message; a fresh agent created after the change called them unprompted.
+
+## Decisions taken under M's delegation
+
+- Front-app-only screenshots are opt-in; the default stays the full display, as in v0.2.0.
+- "Allow <app> this turn" covers clicks, moves, drags, and scrolls in one app only; typing, keys, and opening apps always ask; it clears on turn end, close, archive, mode change, and Stop.
+- Not shipped: Electron accessibility via `AXManualAccessibility` (accepted by macOS but no effect on Paseo or Slack), held mouse buttons and keys (need release-on-Stop design), element-targeted presses, finance blocks, multi-display.
 
 ## Criterion coverage
 
-- **Correctness and invariants — pass.** The full tool pipeline and its failure paths are covered by 119 passing tests and a live v0.2.0 TextEdit smoke test.
-- **Modularity and cohesion — pass.** Engine, policy, identity, approvals, audit, panel state, client surfaces, and shared contracts retain separate owners.
-- **Dependency direction — pass.** Client and server depend on shared validated contracts; server-only Node code does not enter the client bundle.
-- **Single source of truth — pass.** Package SemVer is checked against the MCP-advertised version; built-in blocks have one shared owner.
-- **Simplicity and YAGNI — pass.** The implementation keeps one local MCP endpoint and fixed macOS engine without adding an external driver.
-- **Explicit boundaries and contracts — pass.** MCP inputs, RPCs, settings, persisted files, bundle IDs, keys, coordinates, and limits are validated.
-- **Composition and reuse — pass.** Paseo settings, timeline, panel, lifecycle, and MCP SDK contracts are used directly.
-- **Failure behavior — pass.** Invalid input, write failure, timeout, concurrent agents, Stop/Off races, stale screens, archive, and plugin cleanup fail closed.
-- **Data, security, and compatibility — pass.** Tokens are HMAC-authenticated, secrets are mode-repaired, typed content is excluded from logs, settings migrate explicitly, and v0.2.0 truthfully signals the pre-1.0 contract tightening.
-- **Verification — pass.** Regression tests saw red before fixes; full suite, typecheck, audits, package dry run, plugin reload, and live model smoke tests passed.
-- **Operations — pass.** The plugin logs actionable startup failures, caps request and audit sizes, rotates audit output, and exposes Stop/Resume plus recent safe summaries.
-- **Comments and documentation — pass.** README and OVERVIEW describe permissions, provider data flow, mandatory blocks, sandbox limits, and the full-display screenshot limitation.
-
-## What is working
-
-- The MCP endpoint authenticates per-agent seats, binds to loopback, validates tool schemas, and audits calls without typed text.
-- The action pipeline serializes access, re-focuses the working app, re-checks target ownership and safety policy, and verifies pointer delivery.
-- Claude, Codex, OpenCode, and a post-review OpenCode v0.2.0 smoke agent all completed exact TextEdit readback and screenshot delivery without MCP timeouts.
+- **Correctness and invariants — pass.** 155 tests (152 run by default, 3 live) cover the host protocol, queueing, restart, capture routing, the no-fallback rule, scopes, and clearing events.
+- **Modularity and cohesion — pass.** `ScriptHost` owns process lifetime and deadlines; `MacEngine` keeps its interface; scopes live beside approvals.
+- **Dependency direction — pass.** The engine depends on the `ScriptRunner` seam; the pipeline depends on the engine interface only.
+- **Single source of truth — pass.** Script sources stay in `SCRIPTS`; the host compiles them in at start and never receives source over the pipe.
+- **Simplicity and YAGNI — pass.** Unproven items were dropped rather than shipped behind flags.
+- **Explicit boundaries and contracts — pass.** New RPC fields and settings are validated by shared schemas; old approval rows and settings parse with defaults.
+- **Composition and reuse — pass.** Front-app capture reuses the read path's front-app checks; the after-action screenshot reuses the screenshot read.
+- **Failure behavior — pass.** A host death or missed deadline fails the running and queued requests; front-app capture fails loudly instead of showing the full display.
+- **Data, security, and compatibility — pass.** Tool additions are optional; typed text stays out of logs; v0.2.0 settings load unchanged.
+- **Verification — pass.** Mutant probes killed for the run-loop pump and for scope clearing; live tests on macOS 26.7.1.
+- **Operations — pass.** The panel shows Accessibility, Screen Recording, and engine errors, and fetches the screenshot only when it changes.
+- **Comments and documentation — pass.** README and OVERVIEW describe the new tools, settings, approval scope, and Electron limit.
 
 ## Scope and limits
 
-- **Reviewed:** every source and test file, package and lockfile, public documentation, live plugin loading, and provider acceptance behavior
-- **Not reviewed:** Paseo host internals and Apple framework implementations beyond their documented/runtime-observed contracts
-- **Checks not run:** physical iOS/Android rendering; client code passed the mobile static audit and compact-layout contract
-- **Depth and coverage:** deep; high tier 10 of 10 files, medium 13 of 13, low/documentation 5 of 5
-- **Confidence:** high; all findings have regression tests or live runtime evidence
+- **Reviewed:** every changed source and test file, the live engine, the installed plugin, and provider smoke tests.
+- **Not reviewed:** Paseo host internals; Apple framework behavior beyond observed results.
+- **Checks not run:** front-app capture with Screen Recording revoked (whether macOS returns no image or a blank one); multi-display.
+- **Confidence:** high for the engine and pipeline; medium for front-app capture behavior when Screen Recording is missing.
 
 ## In plain terms
 
-The review found and fixed real safety, privacy, concurrency, lifecycle, dependency, and compatibility defects. Computerise v0.2.0 is ready to release, with mandatory built-in blocks and explicit migration from v0.1.0 settings.
+Computerise v0.3.0 is faster and adds controls without moving any safety check. The review found and fixed four real defects during the build, including a stale-state bug that would have weakened the blocklist.

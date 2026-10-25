@@ -216,5 +216,79 @@ function run(argv) {
   return JSON.stringify({ elements: elements, cut: cut });
 }`;
 
-export const SCRIPTS = { status, windowAt, pointer, keyboard, activate, resolveApp, uiSnapshot } as const;
+// Draws every on-screen window of one process onto a black canvas covering a region of the main
+// display, at the windows' real positions, so a coordinate read off the image is still the point to
+// click. Other apps' windows never reach the image. Windows are drawn back to front. The canvas has
+// its origin at the bottom left, while window bounds have theirs at the top left. Prints how many
+// of the process's windows were drawn: none drawn of some means macOS refused the capture.
+const compose = String.raw`
+ObjC.import('AppKit');
+ObjC.import('CoreGraphics');
+function run(argv) {
+  var a = JSON.parse(argv[0]);
+  var x0 = a.region[0], y0 = a.region[1], width = (a.region[2] - x0) * a.scale, height = (a.region[3] - y0) * a.scale;
+  var onScreenOnly = 1, excludeDesktop = 16, includingWindow = 8, ignoreFraming = 1;
+  var windows = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(onScreenOnly | excludeDesktop, 0)));
+  var rep = $.NSBitmapImageRep.alloc.initWithBitmapDataPlanesPixelsWidePixelsHighBitsPerSampleSamplesPerPixelHasAlphaIsPlanarColorSpaceNameBytesPerRowBitsPerPixel(null, width, height, 8, 4, true, false, $.NSDeviceRGBColorSpace, 0, 0);
+  var context = $.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep);
+  $.NSGraphicsContext.saveGraphicsState;
+  $.NSGraphicsContext.setCurrentContext(context);
+  $.NSColor.blackColor.setFill;
+  $.NSRectFill({ origin: { x: 0, y: 0 }, size: { width: width, height: height } });
+  var drawn = 0, owned = 0;
+  for (var i = windows.length - 1; i >= 0; i--) {
+    var w = windows[i];
+    if (w.kCGWindowOwnerPID !== a.pid) continue;
+    owned++;
+    var image = $.CGWindowListCreateImage({ origin: { x: Infinity, y: Infinity }, size: { width: 0, height: 0 } }, includingWindow, w.kCGWindowNumber, ignoreFraming);
+    if (!image) continue;
+    var b = w.kCGWindowBounds;
+    $.CGContextDrawImage(context.CGContext, { origin: { x: (b.X - x0) * a.scale, y: height - (b.Y - y0 + b.Height) * a.scale }, size: { width: b.Width * a.scale, height: b.Height * a.scale } }, image);
+    drawn++;
+  }
+  $.NSGraphicsContext.restoreGraphicsState;
+  var jpeg = 3;
+  rep.representationUsingTypeProperties(jpeg, $({ NSImageCompressionFactor: 0.7 })).writeToFileAtomically(a.out, true);
+  return JSON.stringify({ drawn: drawn, windows: owned });
+}`;
+
+export const SCRIPTS = { status, windowAt, pointer, keyboard, activate, resolveApp, uiSnapshot, compose } as const;
 export type ScriptName = keyof typeof SCRIPTS;
+
+// One long-lived osascript that runs the fixed programs above on request, so each call costs about
+// a millisecond instead of a new process. Every program is compiled in at start; requests carry only
+// a name and a JSON input. Protocol: one JSON line in ({ id, name, input }), one JSON line out
+// ({ id, out } or { id, error }). Before every request the run loop is pumped, because a process
+// that never runs it keeps reporting the app that was in front earlier (checked 2026-10-25).
+// It exits when stdin closes, so it never outlives the plugin process.
+export function hostProgram(scripts: Record<string, string> = SCRIPTS): string {
+  const programs = Object.entries(scripts)
+    .map(([name, source]) => `PROGRAMS[${JSON.stringify(name)}] = (function () {\n${source}\nreturn run;\n})();`)
+    .join("\n");
+  return String.raw`
+ObjC.import('Foundation');
+var PROGRAMS = {};
+${programs}
+function send(out, reply) {
+  out.writeData($(JSON.stringify(reply) + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
+}
+function run() {
+  var stdin = $.NSFileHandle.fileHandleWithStandardInput, out = $.NSFileHandle.fileHandleWithStandardOutput, buffered = '';
+  while (true) {
+    var data = stdin.availableData;
+    if (Number(data.length) === 0) return;
+    buffered += ObjC.unwrap($.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding));
+    var end;
+    while ((end = buffered.indexOf('\n')) >= 0) {
+      var request = JSON.parse(buffered.slice(0, end));
+      buffered = buffered.slice(end + 1);
+      $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.005));
+      try {
+        send(out, { id: request.id, out: PROGRAMS[request.name]([JSON.stringify(request.input)]) });
+      } catch (error) {
+        send(out, { id: request.id, error: String(error && error.message ? error.message : error) });
+      }
+    }
+  }
+}`;
+}

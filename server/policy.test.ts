@@ -59,9 +59,15 @@ describe("the settings document", () => {
       approvalTimeoutSeconds: 30,
       extraNoInput: ["com.apple.Notes"],
       extraNoView: [],
+      screenshotScope: "display",
       mcpPort: 6797,
     });
     expect(() => computerSettings.migrate?.({}, 0)).toThrow("Cannot migrate computer settings from version 0");
+  });
+
+  it("reads version 2 settings saved before the screenshot scope existed as full-display capture", () => {
+    expect(settingsSchema.parse({ approvalTimeoutSeconds: 45, extraNoInput: [], extraNoView: [], mcpPort: 6797 }).screenshotScope).toBe("display");
+    expect(() => settingsSchema.parse({ screenshotScope: "everything" })).toThrow();
   });
 });
 

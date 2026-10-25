@@ -4,11 +4,13 @@ import { mkdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
-import { SCRIPTS, type ScriptName } from "./engine-scripts";
+import type { ScreenRecording } from "../shared/contracts";
+import type { ScriptName } from "./engine-scripts";
 import { modifierFlags, parseKeyCombo } from "./keys";
+import { perCallScripts, type ScriptRunner } from "./script-host";
 
-// The only module that touches macOS. Every call is execFile with fixed programs (no shell); model
-// text reaches them only as one JSON argument.
+// The only module that touches macOS. Every call runs a fixed program (no shell); model text
+// reaches it only as one JSON argument.
 
 export const LIMITS = {
   typeUnits: 2000,
@@ -52,6 +54,7 @@ const windowOwnerSchema = z.object({ pid: z.number().int(), name: z.string(), bu
 const postedSchema = z.object({ posted: z.literal(true) });
 const activateSchema = z.object({ running: z.boolean(), activated: z.boolean() });
 const appSchema = z.object({ bundleId: z.string(), path: z.string() }).nullable();
+const composedSchema = z.object({ drawn: z.number().int().nonnegative(), windows: z.number().int().nonnegative() });
 const snapshotSchema = z.object({
   elements: z.array(
     z.object({
@@ -111,18 +114,20 @@ function failureText(error: unknown): string {
 
 export class MacEngine {
   private readonly run: RunFile;
+  private readonly scripts: ScriptRunner;
   private readonly scratchDir: string;
+  private captureAccess: ScreenRecording = "unknown";
 
-  constructor(options: { run: RunFile; scratchDir: string }) {
+  constructor(options: { run: RunFile; scratchDir: string; scripts?: ScriptRunner }) {
     this.run = options.run;
+    this.scripts = options.scripts ?? perCallScripts(options.run);
     this.scratchDir = options.scratchDir;
   }
 
-  // The input is always a JSON object, so it starts with "{" and osascript never reads it as an option.
   private async script<T>(name: ScriptName, input: object, schema: z.ZodType<T>, timeoutMs = SCRIPT_TIMEOUT_MS): Promise<T> {
     let stdout: string;
     try {
-      stdout = await this.run("osascript", ["-l", "JavaScript", "-e", SCRIPTS[name], JSON.stringify(input)], timeoutMs);
+      stdout = await this.scripts.run(name, input, timeoutMs);
     } catch (error) {
       throw new Error(`The ${name} script failed: ${failureText(error)}`, { cause: error });
     }
@@ -135,6 +140,11 @@ export class MacEngine {
     const result = schema.safeParse(parsed);
     if (!result.success) throw new Error(`The ${name} script returned an unexpected shape: ${result.error.message}`);
     return result.data;
+  }
+
+  // What the last capture showed; "unknown" until the first one.
+  screenRecording(): ScreenRecording {
+    return this.captureAccess;
   }
 
   status(): Promise<ScreenStatus> {
@@ -223,21 +233,42 @@ export class MacEngine {
     return this.script("uiSnapshot", { pid, max: maxElements, budgetMs: SNAPSHOT_BUDGET_MS }, snapshotSchema, SCRIPT_TIMEOUT_MS + SNAPSHOT_BUDGET_MS);
   }
 
-  // Sent at point size, so a coordinate read off the image is the coordinate to click.
-  async screenshot(): Promise<Capture> {
+  // Sent at point size, so a coordinate read off the image is the coordinate to click. With a process
+  // id, only that process's windows are shown and the rest of the display is black.
+  async screenshot(onlyPid: number | null = null): Promise<Capture> {
     const { display } = await this.status();
-    return { jpeg: await this.capture(["-m"], display.width), width: display.width, height: display.height };
+    const jpeg = onlyPid === null ? await this.capture(["-m"], display.width) : await this.composeWindows(onlyPid, [0, 0, display.width, display.height], 1);
+    return { jpeg, width: display.width, height: display.height };
   }
 
-  async zoom(region: Region): Promise<Capture> {
+  async zoom(region: Region, onlyPid: number | null = null): Promise<Capture> {
     const [x0, y0, x1, y1] = region;
     if (!region.every(Number.isInteger)) throw new Error(`Expected whole-point region coordinates, got [${region.join(", ")}]`);
     if (x0 >= x1 || y0 >= y1) throw new Error(`Expected a region [x0, y0, x1, y1] with x0 < x1 and y0 < y1, got [${region.join(", ")}]`);
     const { display } = await this.status();
     requireOnDisplay({ x: x0, y: y0 }, display, "region start");
     requireOnDisplay({ x: x1 - 1, y: y1 - 1 }, display, "region end");
-    const jpeg = await this.capture(["-R", `${x0},${y0},${x1 - x0},${y1 - y0}`], null);
+    const jpeg = onlyPid === null ? await this.capture(["-R", `${x0},${y0},${x1 - x0},${y1 - y0}`], null) : await this.composeWindows(onlyPid, region, display.scale);
     return { jpeg, width: (x1 - x0) * display.scale, height: (y1 - y0) * display.scale };
+  }
+
+  // Never falls back to a full-display capture: that would show what the user chose to hide.
+  private async composeWindows(pid: number, region: Region, scale: number): Promise<Buffer> {
+    requireIntIn("process id", pid, 1, 2 ** 31 - 1);
+    await mkdir(this.scratchDir, { recursive: true, mode: 0o700 });
+    const out = join(this.scratchDir, `${randomUUID()}.jpg`);
+    try {
+      const { drawn, windows } = await this.script("compose", { pid, region, scale, out }, composedSchema, CAPTURE_TIMEOUT_MS);
+      if (windows === 0) throw new Error("The front app has no windows on screen to show");
+      if (drawn === 0) {
+        this.captureAccess = "missing";
+        throw new Error("Paseo needs Screen Recording (System Settings > Privacy & Security > Screen Recording), then a Paseo reopen");
+      }
+      this.captureAccess = "granted";
+      return await readFile(out);
+    } finally {
+      await rm(out, { force: true });
+    }
   }
 
   private async capture(areaArgs: readonly string[], resampleWidth: number | null): Promise<Buffer> {
@@ -247,9 +278,11 @@ export class MacEngine {
     try {
       try {
         await this.run("screencapture", ["-x", ...areaArgs, "-t", "jpg", raw], CAPTURE_TIMEOUT_MS);
+        this.captureAccess = "granted";
       } catch (error) {
         const text = failureText(error);
         if (text.includes("could not create image")) {
+          this.captureAccess = "missing";
           throw new Error("Paseo needs Screen Recording (System Settings > Privacy & Security > Screen Recording), then a Paseo reopen", { cause: error });
         }
         throw new Error(`screencapture failed: ${text}`, { cause: error });

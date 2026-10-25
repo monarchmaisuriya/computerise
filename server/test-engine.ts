@@ -19,12 +19,15 @@ export function fakeEngine() {
     front: TEXTEDIT as { name: string; bundleId: string | null; pid: number } | null,
     under: owner(TEXTEDIT) as WindowOwner | null,
     activateBringsForward: true,
+    screenRecording: "unknown" as "unknown" | "granted" | "missing",
+    statusError: null as string | null,
   };
   const calls: { method: string; args: unknown[] }[] = [];
   const record = (method: string) => async (...args: unknown[]) => void calls.push({ method, args });
   const engine: Engine = {
     status: async () => {
       calls.push({ method: "status", args: [] });
+      if (screen.statusError) throw new Error(screen.statusError);
       return { trusted: screen.trusted, cursor: screen.cursor, front: screen.front, display: { width: 1512, height: 982, scale: 2 } };
     },
     windowAt: async (point) => {
@@ -49,14 +52,15 @@ export function fakeEngine() {
     type: record("type"),
     key: record("key"),
     openApp: record("openApp"),
-    screenshot: async () => {
-      calls.push({ method: "screenshot", args: [] });
+    screenshot: async (onlyPid = null) => {
+      calls.push({ method: "screenshot", args: [onlyPid] });
       return { jpeg: Buffer.from("jpeg"), width: 1512, height: 982 };
     },
-    zoom: async (region) => {
-      calls.push({ method: "zoom", args: [region] });
+    zoom: async (region, onlyPid = null) => {
+      calls.push({ method: "zoom", args: [region, onlyPid] });
       return { jpeg: Buffer.from("zoomed"), width: 200, height: 200 };
     },
+    screenRecording: () => screen.screenRecording,
     uiSnapshot: async (pid, max) => {
       calls.push({ method: "uiSnapshot", args: [pid, max] });
       return { elements: [{ role: "AXTextArea", label: null, value: "hello", frame: [10, 20, 300, 400] }], cut: false };

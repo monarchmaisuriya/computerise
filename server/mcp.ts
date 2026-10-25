@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import type { Mode, Settings } from "../shared/contracts";
-import type { Approvals } from "./approvals";
+import type { Approvals, ApprovalScopes } from "./approvals";
 import type { AuditLog } from "./audit";
 import { LIMITS, type MacEngine, type MouseButton, type Point, type ScreenStatus, type ScrollDirection } from "./engine";
 import { type AppRef, blockLevel, type ControlStore, type Failsafe, type Lease, LeaseHeldError, type RateLimiter } from "./policy";
@@ -14,12 +14,15 @@ import { PLUGIN_VERSION } from "./version";
 
 // Distinctive name: Paseo preapproves this server's tools by name, so a user's own server must not share it.
 export const SERVER_NAME = "paseo-computerise";
-export const TOOL_NAMES = ["click", "drag", "key", "move", "open_app", "screenshot", "scroll", "type", "ui_snapshot", "zoom"] as const;
+export const TOOL_NAMES = ["click", "cursor_position", "drag", "key", "move", "open_app", "screenshot", "scroll", "type", "ui_snapshot", "wait", "zoom"] as const;
 const PATH = "/mcp";
 const MAX_REQUEST_BYTES = 64 * 1024;
 const FRONT_WAIT_MS = 1_000;
 const FRONT_POLL_MS = 100;
 const SHOWN_TEXT_CHARS = 300;
+// Time for the screen to redraw before the screenshot an action was asked to return.
+const SETTLE_MS = 300;
+const MAX_WAIT_SECONDS = 10;
 
 export const OFF_MESSAGE = "Computer use is off for this agent; the user can turn it on with /computer ask";
 const NOT_READY = "Computer use is not ready for this agent yet; try again in a moment";
@@ -27,7 +30,7 @@ const STOPPED = "Computer use is stopped by the user; they can resume it from th
 
 export type Engine = Pick<
   MacEngine,
-  "status" | "windowAt" | "activate" | "resolveApp" | "openApp" | "click" | "move" | "drag" | "scroll" | "type" | "key" | "screenshot" | "zoom" | "uiSnapshot"
+  "status" | "windowAt" | "activate" | "resolveApp" | "openApp" | "click" | "move" | "drag" | "scroll" | "type" | "key" | "screenshot" | "zoom" | "uiSnapshot" | "screenRecording"
 >;
 
 export interface ComputerMcpOptions {
@@ -40,6 +43,7 @@ export interface ComputerMcpOptions {
   rates: RateLimiter;
   failsafe: Failsafe;
   approvals: Approvals;
+  scopes: ApprovalScopes;
   audit: AuditLog;
   panel?: PanelState;
   settings(): Promise<Settings>;
@@ -57,14 +61,24 @@ class Refusal extends Error {}
 
 type ReadSpec<A> = {
   kind: "read";
-  run(agentId: string, args: A, status: ScreenStatus): Promise<{ content: Content[]; accepted?(): void }>;
+  run(agentId: string, args: A, status: ScreenStatus, settings: Settings): Promise<{ content: Content[]; accepted?(): void }>;
 };
+
+// The process whose windows a capture may show, or null for the whole display.
+function capturedPid(status: ScreenStatus, settings: Settings): number | null {
+  if (settings.screenshotScope === "display") return null;
+  if (!status.front) throw new Refusal("No app is in front to capture");
+  return status.front.pid;
+}
 
 // The receivers are the apps that get the input. They are read before approval ("planned") and
 // again after the working app is back in front ("actual"); both must match and pass the blocklist.
 type ActionSpec<A> = {
   kind: "action";
   needsWorkingApp: boolean;
+  // Pointer actions the user may allow for one app for the rest of the turn. Typing, keys, and
+  // opening apps always ask.
+  scopable?: true;
   receivers(args: A, working: AppRef | null, phase: "planned" | "actual"): Promise<AppRef[]>;
   describe(args: A, receivers: AppRef[]): string;
   act(args: A, receivers: AppRef[]): Promise<void>;
@@ -72,7 +86,13 @@ type ActionSpec<A> = {
   chars?(args: A): number;
 };
 
-type ToolSpec<A> = ReadSpec<A> | ActionSpec<A>;
+// Touches nothing on the Mac; still subject to identity, stop, mode, and rate checks.
+type PauseSpec<A> = {
+  kind: "pause";
+  run(args: A): Promise<Content[]>;
+};
+
+type ToolSpec<A> = ReadSpec<A> | ActionSpec<A> | PauseSpec<A>;
 
 function textContent(text: string): Content[] {
   return [{ type: "text", text }];
@@ -86,6 +106,13 @@ function appLabel(app: AppRef): string {
   return `${app.name} (${app.bundleId ?? "unknown app"})`;
 }
 
+// The one identifiable app that receives every part of an action, or null.
+function singleApp(apps: AppRef[]): { bundleId: string; name: string } | null {
+  const [first] = apps;
+  if (!first || first.bundleId === null || apps.some((app) => app.bundleId !== first.bundleId)) return null;
+  return { bundleId: first.bundleId, name: first.name };
+}
+
 function sameApps(a: AppRef[], b: AppRef[]): boolean {
   return a.length === b.length && a.every((app, i) => app.bundleId === b[i].bundleId);
 }
@@ -95,12 +122,37 @@ function shownText(text: string): string {
 }
 
 const coordinate = z.number().describe("Main-display points, as read off the screenshot");
-const pair = z.tuple([coordinate, coordinate]);
+// Fixed-length arrays, not tuples: tuples become draft-07 array "items", which JSON Schema draft
+// 2020-12 rejects, and with it Anthropic's API and every client that forwards to it.
+const pair = z.array(coordinate).length(2).describe("[x, y] in main-display points");
+const screenshotAfter = z.boolean().optional().describe("Also return a screenshot taken just after the action");
+
+function wantsScreenshot(args: unknown): boolean {
+  return Reflect.get(Object(args), "screenshot") === true;
+}
 
 export class ComputerMcp {
   private executions: Promise<unknown> = Promise.resolve();
+  private readonly screenshotSpec: ReadSpec<Record<string, never>>;
 
-  constructor(private readonly options: ComputerMcpOptions) {}
+  constructor(private readonly options: ComputerMcpOptions) {
+    this.screenshotSpec = {
+      kind: "read",
+      run: async (agentId, _args, status, settings) => {
+        const pid = capturedPid(status, settings);
+        const shot = await options.engine.screenshot(pid);
+        const front = status.front ? appLabel(status.front) : "none";
+        const scope = pid === null ? "" : "; only the front app's windows are shown, the rest is black";
+        return {
+          content: [
+            { type: "image", data: shot.jpeg.toString("base64"), mimeType: "image/jpeg" },
+            { type: "text", text: `Main display, ${shot.width} x ${shot.height} points; front app: ${front}; pointer at ${at(status.cursor)}${scope}` },
+          ],
+          accepted: () => options.panel?.screenshot(agentId, shot.jpeg, shot.width, shot.height),
+        };
+      },
+    };
+  }
 
   async stopAll(): Promise<void> {
     let persistenceError: unknown;
@@ -108,6 +160,7 @@ export class ComputerMcp {
       persistenceError = error;
     });
     this.options.approvals.cancelAll();
+    this.options.scopes.clearAll();
     this.options.lease.releaseAll();
     if (persistenceError) throw persistenceError;
   }
@@ -154,7 +207,7 @@ export class ComputerMcp {
   private async read<A>(agentId: string, spec: ReadSpec<A>, args: A, status: ScreenStatus, settings: Settings) {
     const front = status.front;
     if (front && blockLevel(front.bundleId, settings) === "no-view") throw new Refusal(`${appLabel(front)} is blocked from view`);
-    const result = await spec.run(agentId, args, status);
+    const result = await spec.run(agentId, args, status, settings);
     const after = await this.options.engine.status();
     if (after.front && blockLevel(after.front.bundleId, settings) === "no-view") throw new Refusal(`${appLabel(after.front)} is blocked from view`);
     if (after.front?.pid !== front?.pid || after.front?.bundleId !== front?.bundleId) throw new Refusal("The screen changed while reading; try again");
@@ -164,18 +217,20 @@ export class ComputerMcp {
   }
 
   private async act<A>(agentId: string, mode: Mode, spec: ActionSpec<A>, args: A, settings: Settings) {
-    const { approvals, lease } = this.options;
+    const { approvals, scopes, lease } = this.options;
     const working = lease.workingApp(agentId);
     if (spec.needsWorkingApp && working === null) throw new Refusal("Take a screenshot first, so the plugin knows which app you are working in");
     const planned = await spec.receivers(args, working, "planned");
     this.requireInputAllowed(planned, settings);
     const description = spec.describe(args, planned);
-    if (mode === "ask") {
-      const decision = await approvals.request(agentId, description, [...new Set(planned.map((app) => app.name))].join(", "));
+    if (mode === "ask" && !(spec.scopable && scopes.covers(agentId, planned))) {
+      const scopeApp = spec.scopable ? singleApp(planned) : null;
+      const decision = await approvals.request(agentId, description, [...new Set(planned.map((app) => app.name))].join(", "), scopeApp?.name ?? null);
       if (decision === "deny") throw new Refusal("The user denied this action");
       if (decision === "timeout") throw new Refusal("The user did not answer in time; nothing was done");
       if (decision === "cancelled") throw new Refusal("Computer use was stopped by the user");
       this.requireRunning(agentId);
+      if (decision === "allow-app" && scopeApp) scopes.allow(agentId, scopeApp.bundleId);
     }
     return this.exclusive(async () => {
       if (spec.needsWorkingApp && working !== null) await this.bringForward(working);
@@ -195,10 +250,50 @@ export class ComputerMcp {
     });
   }
 
-  // Every tool runs through here, in this order: identity, stop, mode, rate limit, corner failsafe,
-  // lease, then the read or action path. Argument schemas are checked by the MCP server before.
+  // The action already happened, so a refused or failed screenshot is reported, not raised. It is
+  // audited as its own screenshot, like one the agent asked for separately.
+  private async screenshotAfterAction(agentId: string): Promise<Content[]> {
+    const { engine, audit, panel } = this.options;
+    await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
+    let target: string | null = null;
+    try {
+      const status = await engine.status();
+      const result = await this.read(agentId, this.screenshotSpec, {}, status, await this.options.settings());
+      target = result.target;
+      await audit.record({ agentId, tool: "screenshot", target, outcome: "ok" });
+      panel?.activity({ agentId, tool: "screenshot", target, outcome: "ok" });
+      return result.content;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const outcome = error instanceof Refusal ? `refused: ${message}` : `error: ${message}`;
+      await audit.record({ agentId, tool: "screenshot", target, outcome }).catch((auditError: unknown) => console.error(`[computerise] audit write failed: ${String(auditError)}`));
+      panel?.activity({ agentId, tool: "screenshot", target, outcome });
+      return textContent(`No screenshot: ${message}`);
+    }
+  }
+
+  private async onScreen<A>(agentId: string, mode: Mode, spec: ReadSpec<A> | ActionSpec<A>, args: A) {
+    const { engine, failsafe, lease } = this.options;
+    const status = await engine.status();
+    if (failsafe.tripped(status.cursor)) {
+      await this.stopAll();
+      throw new Refusal("The pointer is in the top-left corner, so computer use is now stopped; the user can resume it from the Computer panel");
+    }
+    try {
+      lease.take(agentId);
+    } catch (error) {
+      if (error instanceof LeaseHeldError) throw new Refusal(`Agent ${await this.options.agentTitle(error.holder)} is using the screen`);
+      throw error;
+    }
+    const settings = await this.options.settings();
+    return spec.kind === "read" ? this.read(agentId, spec, args, status, settings) : this.act(agentId, mode, spec, args, settings);
+  }
+
+  // Every tool runs through here, in this order: identity, stop, mode, rate limit, then (for tools
+  // that touch the screen) corner failsafe, lease, and the read or action path. Argument schemas are
+  // checked by the MCP server before.
   private async call<A>(seat: string, tool: string, spec: ToolSpec<A>, args: A) {
-    const { engine, seats, calls, rates, failsafe, lease, audit } = this.options;
+    const { seats, calls, rates, audit } = this.options;
     let agentId: string | null = null;
     let target: string | null = null;
     const chars = spec.kind === "action" ? spec.chars?.(args) : undefined;
@@ -208,22 +303,11 @@ export class ComputerMcp {
       const mode = this.requireRunning(agentId);
       calls.take(agentId);
       if (spec.kind === "action") rates.take(agentId);
-      const status = await engine.status();
-      if (failsafe.tripped(status.cursor)) {
-        await this.stopAll();
-        throw new Refusal("The pointer is in the top-left corner, so computer use is now stopped; the user can resume it from the Computer panel");
-      }
-      try {
-        lease.take(agentId);
-      } catch (error) {
-        if (error instanceof LeaseHeldError) throw new Refusal(`Agent ${await this.options.agentTitle(error.holder)} is using the screen`);
-        throw error;
-      }
-      const settings = await this.options.settings();
-      const result = spec.kind === "read" ? await this.read(agentId, spec, args, status, settings) : await this.act(agentId, mode, spec, args, settings);
+      const result = spec.kind === "pause" ? { content: await spec.run(args), target: null } : await this.onScreen(agentId, mode, spec, args);
       target = result.target;
       await audit.record({ agentId, tool, target, outcome: "ok", chars });
       this.options.panel?.activity({ agentId, tool, target, outcome: "ok", chars });
+      if (spec.kind === "action" && wantsScreenshot(args)) return { content: [...result.content, ...(await this.screenshotAfterAction(agentId))] };
       return { content: result.content };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -238,8 +322,9 @@ export class ComputerMcp {
   private buildServer(seat: string): McpServer {
     const { engine, lease, failsafe } = this.options;
     const mcp = new McpServer({ name: SERVER_NAME, version: PLUGIN_VERSION });
-    const register = <A>(name: (typeof TOOL_NAMES)[number], description: string, inputSchema: z.ZodRawShape, spec: ToolSpec<A>) => {
-      mcp.registerTool(name, { description, inputSchema }, (args: unknown) => this.call(seat, name, spec, args as A));
+    // Annotations are hints for clients; the pipeline above is what enforces the rules.
+    const register = <A>(name: (typeof TOOL_NAMES)[number], title: string, description: string, inputSchema: z.ZodRawShape, spec: ToolSpec<A>) => {
+      mcp.registerTool(name, { title, description, inputSchema, annotations: { readOnlyHint: spec.kind !== "action" } }, (args: unknown) => this.call(seat, name, spec, args as A));
     };
     const pointerAt = async (point: Point) => [await this.appAt(point)];
     // Keyboard input goes to the front app; before approval that is meant to be the working app.
@@ -249,29 +334,39 @@ export class ComputerMcp {
       return front ? [{ bundleId: front.bundleId, name: front.name }] : [];
     };
 
-    register("screenshot", "Capture the main display. The image is at point size: a coordinate read off it is the coordinate to click.", {}, {
+    register("screenshot", "Screenshot", "Capture the main display. The image is at point size: a coordinate read off it is the coordinate to click.", {}, this.screenshotSpec);
+
+    register<Record<string, never>>("cursor_position", "Pointer position", "Report where the pointer is and which app is in front.", {}, {
       kind: "read",
-      run: async (agentId, _args, status) => {
-        const shot = await engine.screenshot();
+      run: async (_agentId, _args, status) => {
         const front = status.front ? appLabel(status.front) : "none";
-        return {
-          content: [
-            { type: "image", data: shot.jpeg.toString("base64"), mimeType: "image/jpeg" },
-            { type: "text", text: `Main display, ${shot.width} x ${shot.height} points; front app: ${front}; pointer at ${at(status.cursor)}` },
-          ],
-          accepted: () => this.options.panel?.screenshot(agentId, shot.jpeg, shot.width, shot.height),
-        };
+        return { content: textContent(`Pointer at ${at({ x: Math.round(status.cursor.x), y: Math.round(status.cursor.y) })}; front app: ${front}`) };
       },
     });
 
+    register<{ seconds: number }>(
+      "wait",
+      "Wait",
+      `Wait for an app to finish loading or animating, up to ${MAX_WAIT_SECONDS} seconds. Takes no screenshot.`,
+      { seconds: z.number().min(0.1).max(MAX_WAIT_SECONDS) },
+      {
+        kind: "pause",
+        run: async ({ seconds }) => {
+          await new Promise((resolve) => setTimeout(resolve, seconds * 1_000));
+          return textContent(`Waited ${seconds} seconds`);
+        },
+      },
+    );
+
     register<{ region: [number, number, number, number] }>(
       "zoom",
+      "Zoom",
       "Capture a region of the main display at full pixel resolution, to read small text.",
-      { region: z.tuple([z.number().int(), z.number().int(), z.number().int(), z.number().int()]).describe("[x0, y0, x1, y1] in points") },
+      { region: z.array(z.number().int()).length(4).describe("[x0, y0, x1, y1] in points") },
       {
         kind: "read",
-        run: async (_agentId, { region }) => {
-          const shot = await engine.zoom(region);
+        run: async (_agentId, { region }, status, settings) => {
+          const shot = await engine.zoom(region, capturedPid(status, settings));
           return {
             content: [
               { type: "image", data: shot.jpeg.toString("base64"), mimeType: "image/jpeg" },
@@ -284,6 +379,7 @@ export class ComputerMcp {
 
     register<{ max_elements?: number }>(
       "ui_snapshot",
+      "Accessibility snapshot",
       "List the front window's controls as text (role, label, value, frame in points), for reading the screen without images.",
       { max_elements: z.number().int().min(1).max(LIMITS.snapshotElements).optional() },
       {
@@ -305,10 +401,12 @@ export class ComputerMcp {
 
     register<{ x: number; y: number; button?: MouseButton; count?: number; modifiers?: string[] }>(
       "click",
+      "Click",
       "Click at a point.",
       {
         x: coordinate,
         y: coordinate,
+        screenshot: screenshotAfter,
         button: z.enum(["left", "right", "middle"]).optional(),
         count: z.number().int().min(1).max(LIMITS.clickCount).optional().describe("2 for a double click"),
         modifiers: z.array(z.string().max(10)).max(4).optional().describe("cmd, shift, option, ctrl"),
@@ -316,6 +414,7 @@ export class ComputerMcp {
       {
         kind: "action",
         needsWorkingApp: true,
+        scopable: true,
         receivers: ({ x, y }) => pointerAt({ x, y }),
         describe: ({ x, y, button = "left", count = 1, modifiers = [] }, [app]) =>
           `click ${button}${count > 1 ? ` x${count}` : ""}${modifiers.length ? ` with ${modifiers.join("+")}` : ""} at ${at({ x, y })} on ${app.name}`,
@@ -324,18 +423,20 @@ export class ComputerMcp {
       },
     );
 
-    register<{ x: number; y: number }>("move", "Move the pointer to a point.", { x: coordinate, y: coordinate }, {
+    register<{ x: number; y: number }>("move", "Move", "Move the pointer to a point.", { x: coordinate, y: coordinate, screenshot: screenshotAfter }, {
       kind: "action",
       needsWorkingApp: true,
+      scopable: true,
       receivers: ({ x, y }) => pointerAt({ x, y }),
       describe: ({ x, y }, [app]) => `move the pointer to ${at({ x, y })} over ${app.name}`,
       act: ({ x, y }) => engine.move({ x, y }),
       after: (_agentId, { x, y }) => failsafe.notePlaced({ x, y }),
     });
 
-    register<{ from: [number, number]; to: [number, number] }>("drag", "Press the left button at one point, move to another, and release.", { from: pair, to: pair }, {
+    register<{ from: [number, number]; to: [number, number] }>("drag", "Drag", "Press the left button at one point, move to another, and release.", { from: pair, to: pair, screenshot: screenshotAfter }, {
       kind: "action",
       needsWorkingApp: true,
+      scopable: true,
       receivers: async ({ from, to }) => [await this.appAt({ x: from[0], y: from[1] }), await this.appAt({ x: to[0], y: to[1] })],
       describe: ({ from, to }, [start, end]) => `drag from ${at({ x: from[0], y: from[1] })} on ${start.name} to ${at({ x: to[0], y: to[1] })} on ${end.name}`,
       act: ({ from, to }) => engine.drag({ x: from[0], y: from[1] }, { x: to[0], y: to[1] }),
@@ -344,11 +445,13 @@ export class ComputerMcp {
 
     register<{ x: number; y: number; direction: ScrollDirection; amount?: number }>(
       "scroll",
+      "Scroll",
       "Scroll at a point by lines.",
-      { x: coordinate, y: coordinate, direction: z.enum(["up", "down", "left", "right"]), amount: z.number().int().min(1).max(LIMITS.scrollAmount).optional() },
+      { x: coordinate, y: coordinate, direction: z.enum(["up", "down", "left", "right"]), amount: z.number().int().min(1).max(LIMITS.scrollAmount).optional(), screenshot: screenshotAfter },
       {
         kind: "action",
         needsWorkingApp: true,
+        scopable: true,
         receivers: ({ x, y }) => pointerAt({ x, y }),
         describe: ({ x, y, direction, amount = 3 }, [app]) => `scroll ${direction} ${amount} at ${at({ x, y })} on ${app.name}`,
         act: ({ x, y, direction, amount = 3 }) => engine.scroll({ x, y }, direction, amount),
@@ -356,7 +459,7 @@ export class ComputerMcp {
       },
     );
 
-    register<{ text: string }>("type", "Type text into the app you are working in.", { text: z.string().min(1).max(LIMITS.typeUnits) }, {
+    register<{ text: string }>("type", "Type", "Type text into the app you are working in.", { text: z.string().min(1).max(LIMITS.typeUnits), screenshot: screenshotAfter }, {
       kind: "action",
       needsWorkingApp: true,
       receivers: keyboardReceivers,
@@ -367,8 +470,9 @@ export class ComputerMcp {
 
     register<{ keys: string; repeat?: number }>(
       "key",
+      "Key press",
       "Press a key combination in the app you are working in, like Return, Tab, cmd+s, ctrl+Page_Down.",
-      { keys: z.string().min(1).max(50), repeat: z.number().int().min(1).max(LIMITS.keyRepeat).optional() },
+      { keys: z.string().min(1).max(50), repeat: z.number().int().min(1).max(LIMITS.keyRepeat).optional(), screenshot: screenshotAfter },
       {
         kind: "action",
         needsWorkingApp: true,
@@ -378,7 +482,7 @@ export class ComputerMcp {
       },
     );
 
-    register<{ name: string }>("open_app", "Open or switch to an app by name; it becomes the app you are working in.", { name: z.string().min(1).max(200) }, {
+    register<{ name: string }>("open_app", "Open app", "Open or switch to an app by name; it becomes the app you are working in.", { name: z.string().min(1).max(200), screenshot: screenshotAfter }, {
       kind: "action",
       needsWorkingApp: false,
       receivers: async ({ name }) => {

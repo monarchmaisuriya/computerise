@@ -6,6 +6,8 @@
 
 Computer use for any Paseo agent on macOS. Computerise gives Claude, Codex, OpenCode, and other MCP-capable agents tools to see and control the Mac running the Paseo daemon.
 
+Current release: **v0.2.0**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
+
 ## What it provides
 
 - Screenshots and zoomed regions
@@ -16,7 +18,7 @@ Computer use for any Paseo agent on macOS. Computerise gives Claude, Codex, Open
 - Per-agent `off`, `ask`, and `auto` modes
 - Allow and Deny cards in agent chats
 - A one-agent-at-a-time screen lease
-- Built-in blocks for Paseo, terminals, code-running apps, System Settings, and password managers
+- Mandatory built-in blocks for Paseo, terminals, code-running apps, System Settings, and password managers
 - Global Stop and Resume controls
 - Audit logging that records typed character counts, never typed text
 
@@ -47,6 +49,8 @@ The composer pill and the **Computer** workspace panel provide the same controls
 Computer use is off by default. Screenshots and accessibility snapshots are returned to the agent and therefore sent to that agent's model provider. Enabling desktop control weakens a provider's command or filesystem sandbox because the agent can operate signed-in desktop applications with the macOS user's permissions.
 
 Ask mode helps prevent mistakes and prompt-injected actions, but it is not a security boundary against an already-hostile agent with arbitrary local command access. See [OVERVIEW.md](OVERVIEW.md) for the complete safety and data notes.
+
+Screenshots capture the full main display. Computerise refuses capture when a password manager is frontmost, but it does not redact other visible windows behind the front app.
 
 ## Development
 

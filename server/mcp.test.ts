@@ -10,11 +10,13 @@ import { type ApprovalRow, type Mode, settingsSchema } from "../shared/contracts
 import { Approvals } from "./approvals";
 import { AuditLog } from "./audit";
 import { ComputerMcp, mcpServerEntry, SERVER_NAME, TOOL_NAMES } from "./mcp";
+import { PanelState } from "./panel-state";
 import { ControlStore, Failsafe, Lease, RateLimiter } from "./policy";
 import { Seats } from "./seats";
 import { fakeEngine, NOTES, ONE_PASSWORD, owner, PASEO } from "./test-engine";
 import { tempDir } from "./test-temp-dir";
 import { TokenAuthority } from "./tokens";
+import { PLUGIN_VERSION } from "./version";
 
 const TOOL_ARGS: Record<string, Record<string, unknown>> = {
   screenshot: {},
@@ -38,6 +40,8 @@ describe("the computer MCP endpoint", () => {
   let rows: { agentId: string; row: ApprovalRow }[];
   let auditPath: string;
   let computer: ComputerMcp;
+  let panel: PanelState;
+  let currentSettings: ReturnType<typeof settingsSchema.parse>;
   let http: Server;
   let port: number;
   let clients: Client[];
@@ -51,17 +55,21 @@ describe("the computer MCP endpoint", () => {
     rows = [];
     approvals = new Approvals({ show: async (agentId, _rowId, row) => void rows.push({ agentId, row }) }, async () => 2_000);
     auditPath = join(root, "audit.jsonl");
+    panel = new PanelState();
+    currentSettings = settingsSchema.parse({});
     computer = new ComputerMcp({
       engine: mac.engine,
       tokens,
       seats,
       control,
       lease: new Lease(120_000),
+      calls: new RateLimiter(120, 60_000),
       rates: new RateLimiter(60, 60_000),
       failsafe: new Failsafe(),
       approvals,
       audit: new AuditLog(auditPath),
-      settings: async () => settingsSchema.parse({}),
+      panel,
+      settings: async () => currentSettings,
       agentTitle: async (agentId) => `title of ${agentId}`,
     });
     http = await computer.listen(0);
@@ -111,6 +119,7 @@ describe("the computer MCP endpoint", () => {
     const names = (await client.listTools()).tools.map((tool) => tool.name).sort();
     expect(names).toEqual(Object.keys(TOOL_ARGS).sort());
     expect(names).toEqual([...TOOL_NAMES]);
+    expect(client.getServerVersion()).toMatchObject({ name: SERVER_NAME, version: PLUGIN_VERSION });
   });
 
   it.each(Object.keys(TOOL_ARGS))("%s does nothing on the Mac while the agent's mode is off", async (tool) => {
@@ -152,6 +161,29 @@ describe("the computer MCP endpoint", () => {
     expect(audit).not.toContain("hunter2");
   });
 
+  it("never writes typed text to audit or panel history when the engine error echoes it", async () => {
+    const client = await agent("agent-x", "auto");
+    await call(client, "screenshot");
+    mac.engine.type = async (text) => {
+      throw new Error(`keyboard command failed with ${text}`);
+    };
+
+    const result = await call(client, "type", { text: "super-secret-value" });
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("super-secret-value");
+    expect(await readFile(auditPath, "utf8")).not.toContain("super-secret-value");
+    expect(JSON.stringify(panel.snapshot())).not.toContain("super-secret-value");
+    expect(panel.snapshot().recent[0]).toMatchObject({ tool: "type", outcome: "error", chars: 18 });
+  });
+
+  it("rate-limits read tools as well as actions", async () => {
+    const client = await agent("agent-x", "auto");
+    for (let i = 0; i < 120; i += 1) expect((await call(client, "screenshot")).isError).toBe(false);
+    const refused = await call(client, "screenshot");
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain("Refused: 120 actions in the last minute");
+  });
+
   it("refuses input until the agent has a working app", async () => {
     const client = await agent("agent-x", "auto");
     const result = await call(client, "type");
@@ -183,6 +215,21 @@ describe("the computer MCP endpoint", () => {
     expect(shot.isError).toBe(true);
     expect(shot.text).toContain("1Password (com.1password.1password) is blocked from view");
     expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot"]);
+  });
+
+  it("drops a read result when a blocked app comes to the front during capture", async () => {
+    const client = await agent("agent-x", "auto");
+    mac.engine.screenshot = async () => {
+      mac.calls.push({ method: "screenshot", args: [] });
+      mac.screen.front = ONE_PASSWORD;
+      return { jpeg: Buffer.from("private"), width: 1512, height: 982 };
+    };
+
+    const result = await call(client, "screenshot");
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("1Password (com.1password.1password) is blocked from view");
+    expect(result.content.some((part) => part.type === "image")).toBe(false);
+    expect(panel.snapshot().screenshot).toBeNull();
   });
 
   it("refuses to open a blocked app and opens an allowed one as the new working app", async () => {
@@ -270,6 +317,55 @@ describe("the computer MCP endpoint", () => {
     expect((await stoppedWhileWaiting).text).toContain("Computer use was stopped by the user");
     expect(rows.map((shown) => shown.row.status)).toEqual(["pending", "allowed", "pending", "cancelled"]);
     expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot"]);
+  });
+
+  it("rechecks stop, mode, and blocklist immediately before every automatic action", async () => {
+    const client = await agent("agent-x", "auto");
+    await call(client, "screenshot");
+
+    await control.setStopped(true);
+    expect((await call(client, "type", { text: "stopped" })).text).toContain("Computer use is stopped");
+    await control.setStopped(false);
+
+    await control.setMode("agent-x", "off");
+    expect((await call(client, "type", { text: "off" })).text).toContain("Computer use is off");
+    await control.setMode("agent-x", "auto");
+
+    const originalWindowAt = mac.engine.windowAt;
+    let reachedPlanning: (() => void) | undefined;
+    const planning = new Promise<void>((resolve) => {
+      reachedPlanning = resolve;
+    });
+    let continuePlanning: (() => void) | undefined;
+    const continueAfterSettingsChange = new Promise<void>((resolve) => {
+      continuePlanning = resolve;
+    });
+    mac.engine.windowAt = async (point) => {
+      reachedPlanning?.();
+      await continueAfterSettingsChange;
+      return originalWindowAt(point);
+    };
+    const pending = call(client, "click");
+    await planning;
+    currentSettings = settingsSchema.parse({ extraNoInput: ["com.apple.TextEdit"] });
+    continuePlanning?.();
+    expect((await pending).text).toContain("TextEdit (com.apple.TextEdit) is blocked for input");
+    expect(mac.effects().some((effect) => effect.method === "click")).toBe(false);
+  });
+
+  it("stops an action when the user moves the pointer to the corner during planning", async () => {
+    const client = await agent("agent-x", "auto");
+    await call(client, "screenshot");
+    const originalWindowAt = mac.engine.windowAt;
+    mac.engine.windowAt = async (point) => {
+      mac.screen.cursor = { x: 0, y: 0 };
+      return originalWindowAt(point);
+    };
+
+    const result = await call(client, "click");
+    expect(result.text).toContain("pointer is in the top-left corner");
+    expect(control.stopped()).toBe(true);
+    expect(mac.effects().some((effect) => effect.method === "click")).toBe(false);
   });
 
   it("stops all computer use when the pointer is pushed into the top-left corner", async () => {

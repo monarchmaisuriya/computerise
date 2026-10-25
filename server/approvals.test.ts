@@ -54,6 +54,63 @@ describe("approvals", () => {
     expect(rows.latest().row.status).toBe("timed out");
   });
 
+  it("starts the timeout only after the approval row is visible", async () => {
+    let showRow: (() => void) | undefined;
+    const shown: ApprovalRow[] = [];
+    const approvals = new Approvals(
+      {
+        show: async (_agentId, _rowId, row) => {
+          shown.push(row);
+          if (row.status === "pending") {
+            await new Promise<void>((resolve) => {
+              showRow = resolve;
+            });
+          }
+        },
+      },
+      async () => 5_000,
+    );
+    const decision = approvals.request("agent-x", "click", "TextEdit");
+    await settle();
+    vi.advanceTimersByTime(60_000);
+    await settle();
+    expect(shown.at(-1)?.status).toBe("pending");
+    expect(approvals.listPending()).toHaveLength(1);
+
+    showRow?.();
+    await settle();
+    vi.advanceTimersByTime(4_999);
+    await settle();
+    expect(approvals.listPending()).toHaveLength(1);
+    vi.advanceTimersByTime(1);
+    expect(await decision).toBe("timeout");
+  });
+
+  it("does not let a slow pending append overwrite cancellation", async () => {
+    let showPending: (() => void) | undefined;
+    const shown: ApprovalRow[] = [];
+    const approvals = new Approvals(
+      {
+        show: async (_agentId, _rowId, row) => {
+          if (row.status === "pending") {
+            await new Promise<void>((resolve) => {
+              showPending = resolve;
+            });
+          }
+          shown.push(row);
+        },
+      },
+      async () => 45_000,
+    );
+    const decision = approvals.request("agent-x", "click", "TextEdit");
+    await settle();
+    approvals.cancelAll();
+    showPending?.();
+    expect(await decision).toBe("cancelled");
+    await settle();
+    expect(shown.map((row) => row.status)).toEqual(["pending", "cancelled"]);
+  });
+
   it("refuses an answer for an unknown request, another agent's request, or one already answered", async () => {
     const rows = fakeRows();
     const approvals = new Approvals(rows.rows, async () => 45_000);

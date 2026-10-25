@@ -10,7 +10,7 @@ export interface ApprovalRows {
 
 const STATUS: Record<Decision, ApprovalStatus> = { allow: "allowed", deny: "denied", timeout: "timed out", cancelled: "cancelled" };
 
-type Pending = { agentId: string; rowId: string; row: ApprovalRow; resolve: (decision: Decision) => void; timer: NodeJS.Timeout };
+type Pending = { agentId: string; rowId: string; row: ApprovalRow; shown: Promise<void>; resolve: (decision: Decision) => void; timer: NodeJS.Timeout | null };
 
 // Approvals are owned by the plugin, not by each agent CLI, so they hold whatever permission mode
 // the CLI runs in.
@@ -27,14 +27,19 @@ export class Approvals {
     const requestId = randomUUID();
     const rowId = `approval-${requestId}`;
     const row: ApprovalRow = { requestId, action, app, status: "pending" };
+    let resolveDecision!: (decision: Decision) => void;
     const decision = new Promise<Decision>((resolve) => {
-      const timer = setTimeout(() => this.finish(requestId, "timeout"), timeoutMs);
-      this.pending.set(requestId, { agentId, rowId, row, resolve, timer });
+      resolveDecision = resolve;
     });
+    const shown = this.rows.show(agentId, rowId, row);
+    this.pending.set(requestId, { agentId, rowId, row, shown, resolve: resolveDecision, timer: null });
     try {
-      await this.rows.show(agentId, rowId, row);
+      await shown;
+      const pending = this.pending.get(requestId);
+      if (pending) pending.timer = setTimeout(() => this.finish(requestId, "timeout"), timeoutMs);
     } catch (error) {
-      clearTimeout(this.pending.get(requestId)?.timer);
+      const timer = this.pending.get(requestId)?.timer;
+      if (timer) clearTimeout(timer);
       this.pending.delete(requestId);
       throw new Error(`Could not ask the user: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
     }
@@ -60,10 +65,10 @@ export class Approvals {
     const pending = this.pending.get(requestId);
     if (!pending) return;
     this.pending.delete(requestId);
-    clearTimeout(pending.timer);
+    if (pending.timer) clearTimeout(pending.timer);
     pending.resolve(decision);
-    this.rows
-      .show(pending.agentId, pending.rowId, { ...pending.row, status: STATUS[decision] })
+    pending.shown
+      .then(() => this.rows.show(pending.agentId, pending.rowId, { ...pending.row, status: STATUS[decision] }))
       .catch((error: unknown) => console.error(`[computerise] could not mark approval ${requestId} ${STATUS[decision]}: ${String(error)}`));
   }
 }

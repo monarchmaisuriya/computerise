@@ -10,6 +10,7 @@ import { type AppRef, blockLevel, type ControlStore, type Failsafe, type Lease, 
 import type { Seats } from "./seats";
 import type { TokenAuthority } from "./tokens";
 import type { PanelState } from "./panel-state";
+import { PLUGIN_VERSION } from "./version";
 
 // Distinctive name: Paseo preapproves this server's tools by name, so a user's own server must not share it.
 export const SERVER_NAME = "paseo-computerise";
@@ -35,6 +36,7 @@ export interface ComputerMcpOptions {
   seats: Seats;
   control: ControlStore;
   lease: Lease;
+  calls: RateLimiter;
   rates: RateLimiter;
   failsafe: Failsafe;
   approvals: Approvals;
@@ -55,7 +57,7 @@ class Refusal extends Error {}
 
 type ReadSpec<A> = {
   kind: "read";
-  run(agentId: string, args: A, status: ScreenStatus): Promise<Content[]>;
+  run(agentId: string, args: A, status: ScreenStatus): Promise<{ content: Content[]; accepted?(): void }>;
 };
 
 // The receivers are the apps that get the input. They are read before approval ("planned") and
@@ -101,9 +103,13 @@ export class ComputerMcp {
   constructor(private readonly options: ComputerMcpOptions) {}
 
   async stopAll(): Promise<void> {
-    await this.options.control.setStopped(true);
+    let persistenceError: unknown;
+    await this.options.control.setStopped(true).catch((error: unknown) => {
+      persistenceError = error;
+    });
     this.options.approvals.cancelAll();
     this.options.lease.releaseAll();
+    if (persistenceError) throw persistenceError;
   }
 
   private requireRunning(agentId: string): Mode {
@@ -148,8 +154,13 @@ export class ComputerMcp {
   private async read<A>(agentId: string, spec: ReadSpec<A>, args: A, status: ScreenStatus, settings: Settings) {
     const front = status.front;
     if (front && blockLevel(front.bundleId, settings) === "no-view") throw new Refusal(`${appLabel(front)} is blocked from view`);
+    const result = await spec.run(agentId, args, status);
+    const after = await this.options.engine.status();
+    if (after.front && blockLevel(after.front.bundleId, settings) === "no-view") throw new Refusal(`${appLabel(after.front)} is blocked from view`);
+    if (after.front?.pid !== front?.pid || after.front?.bundleId !== front?.bundleId) throw new Refusal("The screen changed while reading; try again");
     if (front) this.options.lease.setWorkingApp(agentId, { bundleId: front.bundleId, name: front.name });
-    return { content: await spec.run(agentId, args, status), target: front?.bundleId ?? null };
+    result.accepted?.();
+    return { content: result.content, target: front?.bundleId ?? null };
   }
 
   private async act<A>(agentId: string, mode: Mode, spec: ActionSpec<A>, args: A, settings: Settings) {
@@ -170,7 +181,14 @@ export class ComputerMcp {
       if (spec.needsWorkingApp && working !== null) await this.bringForward(working);
       const actual = await spec.receivers(args, working, "actual");
       if (!sameApps(planned, actual)) throw new Refusal("The screen changed while waiting; take a new screenshot");
-      this.requireInputAllowed(actual, settings);
+      const executionStatus = await this.options.engine.status();
+      const executionSettings = await this.options.settings();
+      this.requireRunning(agentId);
+      if (this.options.failsafe.tripped(executionStatus.cursor)) {
+        await this.stopAll();
+        throw new Refusal("The pointer is in the top-left corner, so computer use is now stopped; the user can resume it from the Computer panel");
+      }
+      this.requireInputAllowed(actual, executionSettings);
       await spec.act(args, actual);
       spec.after?.(agentId, args, actual);
       return { content: textContent(`Done: ${description}`), target: actual.map((app) => app.bundleId).join(",") };
@@ -180,7 +198,7 @@ export class ComputerMcp {
   // Every tool runs through here, in this order: identity, stop, mode, rate limit, corner failsafe,
   // lease, then the read or action path. Argument schemas are checked by the MCP server before.
   private async call<A>(seat: string, tool: string, spec: ToolSpec<A>, args: A) {
-    const { engine, seats, rates, failsafe, lease, audit } = this.options;
+    const { engine, seats, calls, rates, failsafe, lease, audit } = this.options;
     let agentId: string | null = null;
     let target: string | null = null;
     const chars = spec.kind === "action" ? spec.chars?.(args) : undefined;
@@ -188,6 +206,7 @@ export class ComputerMcp {
       agentId = seats.agentFor(seat);
       if (agentId === null) throw new Refusal(NOT_READY);
       const mode = this.requireRunning(agentId);
+      calls.take(agentId);
       if (spec.kind === "action") rates.take(agentId);
       const status = await engine.status();
       if (failsafe.tripped(status.cursor)) {
@@ -209,15 +228,16 @@ export class ComputerMcp {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const outcome = error instanceof Refusal ? `refused: ${message}` : `error: ${message}`;
-      await audit.record({ agentId, tool, target, outcome, chars }).catch((auditError: unknown) => console.error(`[computerise] audit write failed: ${String(auditError)}`));
-      this.options.panel?.activity({ agentId, tool, target, outcome, chars });
+      const recordedOutcome = tool === "type" ? (error instanceof Refusal ? "refused" : "error") : outcome;
+      await audit.record({ agentId, tool, target, outcome: recordedOutcome, chars }).catch((auditError: unknown) => console.error(`[computerise] audit write failed: ${String(auditError)}`));
+      this.options.panel?.activity({ agentId, tool, target, outcome: recordedOutcome, chars });
       return { content: textContent(message), isError: true };
     }
   }
 
   private buildServer(seat: string): McpServer {
     const { engine, lease, failsafe } = this.options;
-    const mcp = new McpServer({ name: SERVER_NAME, version: "0.1.0" });
+    const mcp = new McpServer({ name: SERVER_NAME, version: PLUGIN_VERSION });
     const register = <A>(name: (typeof TOOL_NAMES)[number], description: string, inputSchema: z.ZodRawShape, spec: ToolSpec<A>) => {
       mcp.registerTool(name, { description, inputSchema }, (args: unknown) => this.call(seat, name, spec, args as A));
     };
@@ -233,12 +253,14 @@ export class ComputerMcp {
       kind: "read",
       run: async (agentId, _args, status) => {
         const shot = await engine.screenshot();
-        this.options.panel?.screenshot(agentId, shot.jpeg, shot.width, shot.height);
         const front = status.front ? appLabel(status.front) : "none";
-        return [
-          { type: "image", data: shot.jpeg.toString("base64"), mimeType: "image/jpeg" },
-          { type: "text", text: `Main display, ${shot.width} x ${shot.height} points; front app: ${front}; pointer at ${at(status.cursor)}` },
-        ];
+        return {
+          content: [
+            { type: "image", data: shot.jpeg.toString("base64"), mimeType: "image/jpeg" },
+            { type: "text", text: `Main display, ${shot.width} x ${shot.height} points; front app: ${front}; pointer at ${at(status.cursor)}` },
+          ],
+          accepted: () => this.options.panel?.screenshot(agentId, shot.jpeg, shot.width, shot.height),
+        };
       },
     });
 
@@ -250,10 +272,12 @@ export class ComputerMcp {
         kind: "read",
         run: async (_agentId, { region }) => {
           const shot = await engine.zoom(region);
-          return [
-            { type: "image", data: shot.jpeg.toString("base64"), mimeType: "image/jpeg" },
-            { type: "text", text: `Region [${region.join(", ")}], ${shot.width} x ${shot.height} pixels` },
-          ];
+          return {
+            content: [
+              { type: "image", data: shot.jpeg.toString("base64"), mimeType: "image/jpeg" },
+              { type: "text", text: `Region [${region.join(", ")}], ${shot.width} x ${shot.height} pixels` },
+            ],
+          };
         },
       },
     );
@@ -274,7 +298,7 @@ export class ComputerMcp {
             return `${i + 1}. ${element.role ?? "unknown"}${label}${value}${frame}`;
           });
           const cut = snapshot.cut ? ", cut short" : "";
-          return textContent([`Front window of ${appLabel(status.front)} (${lines.length} elements${cut}):`, ...lines].join("\n"));
+          return { content: textContent([`Front window of ${appLabel(status.front)} (${lines.length} elements${cut}):`, ...lines].join("\n")) };
         },
       },
     );

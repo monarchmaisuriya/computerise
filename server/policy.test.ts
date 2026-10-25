@@ -1,7 +1,7 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { settingsSchema } from "../shared/contracts";
+import { computerSettings, settingsSchema } from "../shared/contracts";
 import { blockLevel, ControlStore, Failsafe, Lease, LeaseHeldError, RateLimiter } from "./policy";
 import { tempDir } from "./test-temp-dir";
 
@@ -22,15 +22,14 @@ describe("the blocklist", () => {
     expect(blockLevel(null, defaults)).toBe("no-input");
   });
 
-  it("lets the user add apps and switch built-ins off, except Paseo", () => {
+  it("lets the user add apps but never switch built-in safety blocks off", () => {
     const settings = settingsSchema.parse({
       extraNoInput: ["com.apple.Notes"],
       extraNoView: ["com.apple.mail"],
-      disabledBuiltIns: ["com.apple.Terminal", "sh.paseo.desktop"],
     });
     expect(blockLevel("com.apple.Notes", settings)).toBe("no-input");
     expect(blockLevel("com.apple.mail", settings)).toBe("no-view");
-    expect(blockLevel("com.apple.Terminal", settings)).toBe("none");
+    expect(blockLevel("com.apple.Terminal", settings)).toBe("no-input");
     expect(blockLevel("sh.paseo.desktop", settings)).toBe("no-input");
   });
 
@@ -46,6 +45,23 @@ describe("the settings document", () => {
     expect(settingsSchema.safeParse({ approvalTimeoutSeconds: 0 }).success).toBe(false);
     expect(settingsSchema.safeParse({ approvalTimeoutSeconds: 56 }).success).toBe(false);
     expect(settingsSchema.safeParse({ extraNoInput: ["not a bundle id; rm"] }).success).toBe(false);
+  });
+
+  it("migrates version 1 settings by dropping the removed built-in-disable escape hatch", async () => {
+    const legacy = {
+      approvalTimeoutSeconds: 30,
+      extraNoInput: ["com.apple.Notes"],
+      extraNoView: [],
+      disabledBuiltIns: ["com.apple.Terminal"],
+      mcpPort: 6797,
+    };
+    expect(settingsSchema.parse(await computerSettings.migrate?.(legacy, 1))).toEqual({
+      approvalTimeoutSeconds: 30,
+      extraNoInput: ["com.apple.Notes"],
+      extraNoView: [],
+      mcpPort: 6797,
+    });
+    expect(() => computerSettings.migrate?.({}, 0)).toThrow("Cannot migrate computer settings from version 0");
   });
 });
 
@@ -98,6 +114,14 @@ describe("the rate limit", () => {
     now = 60_000;
     rates.take("agent-x");
   });
+
+  it("forgets an archived agent's rate history", () => {
+    const rates = new RateLimiter(1, 60_000, () => 0);
+    rates.take("agent-x");
+    expect(() => rates.take("agent-x")).toThrow();
+    rates.release("agent-x");
+    rates.take("agent-x");
+  });
 });
 
 describe("the corner failsafe", () => {
@@ -107,6 +131,7 @@ describe("the corner failsafe", () => {
     expect(failsafe.tripped({ x: 3, y: 0 })).toBe(false);
     failsafe.notePlaced({ x: 0, y: 0 });
     expect(failsafe.tripped({ x: 0, y: 0 })).toBe(false);
+    expect(failsafe.tripped({ x: 0, y: 0 })).toBe(true);
     failsafe.notePlaced({ x: 400, y: 300 });
     expect(failsafe.tripped({ x: 0, y: 1 })).toBe(true);
   });
@@ -134,5 +159,42 @@ describe("modes and the global stop", () => {
     expect(control.problem).toMatch(/control.json could not be read/);
     await control.setMode("agent-x", "auto");
     expect(JSON.parse(await readFile(path, "utf8")).modes).toEqual({ "agent-x": "auto" });
+  });
+
+  it("removes an archived agent's saved mode", async () => {
+    const path = join(tempDir("computerise-control-remove-"), "control.json");
+    const control = await ControlStore.open(path);
+    await control.setMode("agent-x", "auto");
+    await control.removeAgent("agent-x");
+    expect(control.mode("agent-x")).toBe("off");
+    expect((await ControlStore.open(path)).mode("agent-x")).toBe("off");
+  });
+
+  it("keeps the prior safe state when persisting a mode or stop change fails", async () => {
+    const root = tempDir("computerise-control-fail-");
+    const path = join(root, "control.json");
+    const control = await ControlStore.open(path);
+    await control.setStopped(true);
+    await rm(path);
+    await mkdir(path);
+
+    await expect(control.setMode("agent-x", "auto")).rejects.toThrow();
+    expect(control.mode("agent-x")).toBe("off");
+    await expect(control.setStopped(false)).rejects.toThrow();
+    expect(control.stopped()).toBe(true);
+  });
+
+  it("applies safer Off and Stop transitions in memory even when persistence fails", async () => {
+    const root = tempDir("computerise-control-safe-fail-");
+    const path = join(root, "control.json");
+    const control = await ControlStore.open(path);
+    await control.setMode("agent-x", "auto");
+    await rm(path);
+    await mkdir(path);
+
+    await expect(control.setMode("agent-x", "off")).rejects.toThrow();
+    expect(control.mode("agent-x")).toBe("off");
+    await expect(control.setStopped(true)).rejects.toThrow();
+    expect(control.stopped()).toBe(true);
   });
 });

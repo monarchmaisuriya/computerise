@@ -10,14 +10,22 @@ export const settingsSchema = z.object({
   approvalTimeoutSeconds: z.number().int().min(5).max(55).default(45),
   extraNoInput: z.array(bundleIdSchema).max(100).default([]),
   extraNoView: z.array(bundleIdSchema).max(100).default([]),
-  disabledBuiltIns: z.array(bundleIdSchema).max(100).default([]),
   // Fixed, because agents keep the tool server address they were created with. 6790 and 6791 are
   // memorise's on this Mac.
   mcpPort: z.number().int().min(1024).max(65535).default(6797),
 });
 export type Settings = z.infer<typeof settingsSchema>;
 
-export const computerSettings = defineSettings({ id: "computer", scope: "host", version: 1, schema: settingsSchema });
+export const computerSettings = defineSettings({
+  id: "computer",
+  scope: "host",
+  version: 2,
+  schema: settingsSchema,
+  migrate(values, fromVersion) {
+    if (fromVersion !== 1) throw new Error(`Cannot migrate computer settings from version ${fromVersion}`);
+    return settingsSchema.parse(values);
+  },
+});
 
 export const setModeRpc = defineRpc({
   name: "computer.mode.set",

@@ -13,7 +13,7 @@ export function blockLevel(bundleId: string | null, settings: Settings): BlockLe
   if (bundleId === PASEO_BUNDLE_ID) return "no-input";
   if (settings.extraNoView.includes(bundleId)) return "no-view";
   const builtIn = BUILT_IN_BLOCKS.find((block) => block.bundleId === bundleId);
-  if (builtIn && !settings.disabledBuiltIns.includes(bundleId)) return builtIn.level;
+  if (builtIn) return builtIn.level;
   if (settings.extraNoInput.includes(bundleId)) return "no-input";
   return "none";
 }
@@ -85,6 +85,10 @@ export class RateLimiter {
     if (recent.length >= this.limit) throw new Error(`Refused: ${this.limit} actions in the last minute. Slow down.`);
     this.times.set(agentId, [...recent, now]);
   }
+
+  release(agentId: string): void {
+    this.times.delete(agentId);
+  }
 }
 
 const CORNER_POINTS = 2;
@@ -103,7 +107,9 @@ export class Failsafe {
   }
 
   tripped(cursor: Point): boolean {
-    return inCorner(cursor) && !(this.lastPlaced !== null && inCorner(this.lastPlaced));
+    const placedInCorner = this.lastPlaced !== null && inCorner(this.lastPlaced);
+    this.lastPlaced = null;
+    return inCorner(cursor) && !placedInCorner;
   }
 }
 
@@ -113,6 +119,7 @@ type Control = z.infer<typeof controlSchema>;
 // Per-agent modes and the global stop, kept on disk so a restart or crash loop cannot clear a stop.
 export class ControlStore {
   private writes: Promise<void> = Promise.resolve();
+  private revision = 0;
 
   private constructor(
     private readonly path: string,
@@ -138,16 +145,39 @@ export class ControlStore {
   }
 
   setMode(agentId: string, mode: Mode): Promise<void> {
-    return this.save({ ...this.state, modes: { ...this.state.modes, [agentId]: modeSchema.parse(mode) } });
+    const parsed = modeSchema.parse(mode);
+    return this.save((current) => ({ ...current, modes: { ...current.modes, [agentId]: parsed } }), parsed === "off");
   }
 
   setStopped(stopped: boolean): Promise<void> {
-    return this.save({ ...this.state, stopped });
+    return this.save((current) => ({ ...current, stopped }), stopped);
   }
 
-  private save(next: Control): Promise<void> {
-    this.state = next;
-    const write = this.writes.then(() => writeJsonFile(this.path, next));
+  removeAgent(agentId: string): Promise<void> {
+    return this.save((current) => {
+      const modes = { ...current.modes };
+      delete modes[agentId];
+      return { ...current, modes };
+    }, true);
+  }
+
+  private save(change: (current: Control) => Control, keepOnFailure = false): Promise<void> {
+    let write: Promise<void>;
+    if (keepOnFailure) {
+      const next = change(this.state);
+      this.state = next;
+      this.revision += 1;
+      write = this.writes.then(() => writeJsonFile(this.path, next));
+    } else {
+      write = this.writes.then(async () => {
+        const revision = this.revision;
+        const next = change(this.state);
+        await writeJsonFile(this.path, next);
+        // A safer Stop/Off/removal may have happened while this write was in flight. Its queued
+        // snapshot will repair disk next; never overwrite that safer in-memory state here.
+        if (this.revision === revision) this.state = next;
+      });
+    }
     this.writes = write.catch(() => undefined);
     return write;
   }

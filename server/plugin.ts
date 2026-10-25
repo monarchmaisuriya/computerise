@@ -18,6 +18,7 @@ export const PROMPT_SECTION_START = "<computerise>";
 const PROMPT_SECTION_END = "</computerise>";
 const LEASE_IDLE_MS = 120_000;
 const ACTIONS_PER_MINUTE = 60;
+const CALLS_PER_MINUTE = 120;
 const MINUTE_MS = 60_000;
 
 const PROMPT_SECTION = [
@@ -45,6 +46,8 @@ interface Runtime {
   seats: Seats;
   control: ControlStore;
   lease: Lease;
+  calls: RateLimiter;
+  rates: RateLimiter;
   approvals: Approvals;
   panel: PanelState;
   // The address agents are given; null when the tool server could not listen.
@@ -90,6 +93,8 @@ export function contributeComputer(server: PluginServerContext, options: Compute
     const control = await ControlStore.open(join(root, "control.json"));
     for (const problem of [seats.problem, control.problem]) if (problem) console.error(`[computerise] ${problem}; starting with nothing allowed`);
     const lease = new Lease(LEASE_IDLE_MS);
+    const calls = new RateLimiter(CALLS_PER_MINUTE, MINUTE_MS);
+    const rates = new RateLimiter(ACTIONS_PER_MINUTE, MINUTE_MS);
     const approvals = new Approvals(
       {
         show: async (agentId, rowId, row) => {
@@ -107,7 +112,8 @@ export function contributeComputer(server: PluginServerContext, options: Compute
       seats,
       control,
       lease,
-      rates: new RateLimiter(ACTIONS_PER_MINUTE, MINUTE_MS),
+      calls,
+      rates,
       failsafe: new Failsafe(),
       approvals,
       audit: new AuditLog(join(root, "audit.jsonl")),
@@ -115,7 +121,7 @@ export function contributeComputer(server: PluginServerContext, options: Compute
       settings: currentSettings,
       agentTitle,
     });
-    const base = { computer, tokens, seats, control, lease, approvals, panel };
+    const base = { computer, tokens, seats, control, lease, calls, rates, approvals, panel };
     const { mcpPort } = await currentSettings();
     try {
       const http = await computer.listen(mcpPort);
@@ -196,7 +202,16 @@ export function contributeComputer(server: PluginServerContext, options: Compute
   };
   server.on("agent.turn_ended", releaseLease);
   server.on("agent.closed", releaseLease);
-  server.on("agent.archived", releaseLease);
+  server.on("agent.archived", async ({ agent }, { paseo: api }) => {
+    remember(api);
+    if (!runtime) return;
+    const { lease, calls, rates, seats, control } = await runtime;
+    lease.release(agent.id);
+    calls.release(agent.id);
+    rates.release(agent.id);
+    await seats.revokeAgent(agent.id);
+    await control.removeAgent(agent.id);
+  });
 
   server.handle(setModeRpc, async ({ agentId, mode }, { paseo: api }) => {
     remember(api);

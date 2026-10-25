@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 
@@ -40,10 +40,12 @@ export class TokenAuthority {
 export async function loadTokenSecret(root: string): Promise<Buffer> {
   const path = join(root, "secret");
   await mkdir(root, { recursive: true, mode: 0o700 });
+  await chmod(root, 0o700);
   try {
     await writeFile(path, randomBytes(SECRET_BYTES), { flag: "wx", mode: 0o600 });
   } catch (error) {
     if (Reflect.get(Object(error), "code") !== "EEXIST") throw error;
   }
+  await chmod(path, 0o600);
   return readFile(path);
 }

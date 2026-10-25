@@ -1,8 +1,7 @@
 import { type PluginSurfaceProps, useSettings } from "@getpaseo/plugin/client";
-import { SettingsAction, SettingsCard, SettingsInput, SettingsSection, SettingsSwitch } from "@getpaseo/plugin/client/ui";
+import { SettingsAction, SettingsCard, SettingsInput, SettingsSection } from "@getpaseo/plugin/client/ui";
 import { useState } from "react";
 import { Text } from "react-native";
-import { BUILT_IN_BLOCKS } from "../shared/blocks";
 import { computerSettings, type Settings } from "../shared/contracts";
 import { parseBundleIds, parseTimeout } from "./settings-draft";
 
@@ -47,19 +46,7 @@ export function ComputerSettingsScreen({ theme }: PluginSurfaceProps) {
           <SettingsInput label="Wait for an answer (seconds)" hint="From 5 to 55. Default 45. An unanswered action does nothing." initialValue={String(settings.values.approvalTimeoutSeconds)} disabled={settings.saving} onChangeText={setTimeoutDraft} />
         </SettingsCard>
       </SettingsSection>
-      <SettingsSection title="Blocked apps" info="Paseo is always blocked so an agent cannot approve itself. Password managers are hidden from screenshots as well as input.">
-        <SettingsCard>
-          {BUILT_IN_BLOCKS.filter((block) => block.removable).map((block) => (
-            <SettingsSwitch
-              key={block.bundleId}
-              label={`${block.name}: ${block.level === "no-view" ? "hide and block input" : "block input"}`}
-              hint={block.bundleId}
-              value={!settings.values.disabledBuiltIns.includes(block.bundleId)}
-              disabled={settings.saving}
-              onValueChange={(enabled) => save({ ...settings.values, disabledBuiltIns: enabled ? settings.values.disabledBuiltIns.filter((id) => id !== block.bundleId) : [...new Set([...settings.values.disabledBuiltIns, block.bundleId])] })}
-            />
-          ))}
-        </SettingsCard>
+      <SettingsSection title="Blocked apps" info="Paseo, terminals, code-running apps, System Settings, and password managers are always blocked. Password managers are hidden from screenshots as well as input.">
         <SettingsCard>
           <SettingsInput label="Extra apps with input blocked" hint="Bundle IDs separated by commas or new lines." initialValue={settings.values.extraNoInput.join("\n")} disabled={settings.saving} onChangeText={setNoInput} />
           <SettingsInput label="Extra apps hidden and blocked" hint="Bundle IDs separated by commas or new lines." initialValue={settings.values.extraNoView.join("\n")} disabled={settings.saving} onChangeText={setNoView} />

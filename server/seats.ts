@@ -10,6 +10,7 @@ const seatsSchema = z.record(z.string(), z.string());
 // binds it to the agent id in agent.session_open (reason "create"). Tokens name the seat.
 export class Seats {
   private writes: Promise<void> = Promise.resolve();
+  private revision = 0;
 
   private constructor(
     private readonly path: string,
@@ -31,11 +32,23 @@ export class Seats {
   }
 
   bind(seat: string, agentId: string): Promise<void> {
-    const bound = this.agentFor(seat);
-    if (bound === agentId) return this.writes;
-    if (bound !== null) return Promise.reject(new Error(`Seat ${seat} already belongs to agent ${bound}`));
-    this.bindings = { ...this.bindings, [seat]: agentId };
-    const next = this.bindings;
+    const write = this.writes.then(async () => {
+      const bound = this.agentFor(seat);
+      if (bound === agentId) return;
+      if (bound !== null) throw new Error(`Seat ${seat} already belongs to agent ${bound}`);
+      const revision = this.revision;
+      const next = { ...this.bindings, [seat]: agentId };
+      await writeJsonFile(this.path, next);
+      if (this.revision === revision) this.bindings = next;
+    });
+    this.writes = write.catch(() => undefined);
+    return write;
+  }
+
+  revokeAgent(agentId: string): Promise<void> {
+    const next = Object.fromEntries(Object.entries(this.bindings).filter(([, bound]) => bound !== agentId));
+    this.bindings = next;
+    this.revision += 1;
     const write = this.writes.then(() => writeJsonFile(this.path, next));
     this.writes = write.catch(() => undefined);
     return write;

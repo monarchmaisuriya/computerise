@@ -179,6 +179,18 @@ describe("computerise server entry", () => {
     expect((await callTool(clientY, "screenshot")).isError).toBe(false);
   });
 
+  it("revokes an archived agent's token and saved mode", async () => {
+    const fake = start();
+    const created = await createAgent(fake, "agent-x");
+    await fake.call("computer.mode.set", { agentId: "agent-x", mode: "auto" });
+    const client = await connect(created);
+    expect((await callTool(client, "screenshot")).isError).toBe(false);
+
+    await fake.archived("agent-x");
+    expect((await callTool(client, "screenshot")).text).toContain("not ready");
+    expect(await fake.call("computer.status", {})).toEqual({ stopped: false, modes: {}, holder: null });
+  });
+
   it("shows approval rows in the agent's chat and takes the answer through the RPC", async () => {
     const fake = start();
     const x = await createAgent(fake, "agent-x");

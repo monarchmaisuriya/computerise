@@ -1,7 +1,7 @@
 import { type PluginWorkspacePanelProps, usePaseo, useRpc } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Image, Pressable, ScrollView, Text, View } from "react-native";
-import { answerApprovalRpc, type ApprovalScope, panelScreenshotRpc, panelStatusRpc, type ScreenRecording, setModeRpc, setStopRpc, type Mode } from "../shared/contracts";
+import { answerApprovalRpc, type ApprovalScope, panelHealthRpc, panelScreenshotRpc, panelStatusRpc, type ScreenRecording, setModeRpc, setStopRpc, type Mode } from "../shared/contracts";
 import { errorText } from "./errors";
 
 function modeLabel(mode: Mode): string {
@@ -16,11 +16,15 @@ export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePan
   const paseo = usePaseo();
   const status = useRpc(panelStatusRpc);
   const image = useRpc(panelScreenshotRpc);
+  const healthRpc = useRpc(panelHealthRpc);
   const setMode = useRpc(setModeRpc);
   const setStop = useRpc(setStopRpc);
   const answer = useRpc(answerApprovalRpc);
   const queryClient = useQueryClient();
   const query = useQuery({ queryKey: ["computerise-panel"], queryFn: () => status({}), refetchInterval: 2_000 });
+  // Its own query, so a long engine call never holds back the controls above.
+  const healthQuery = useQuery({ queryKey: ["computerise-panel-health"], queryFn: () => healthRpc({}), refetchInterval: 5_000 });
+  const health = healthQuery.data;
   const shotId = query.data?.screenshot?.id ?? null;
   const shotQuery = useQuery({ queryKey: ["computerise-panel-shot", shotId], queryFn: () => image({ id: shotId as string }), enabled: shotId !== null, staleTime: Infinity });
   const agentQuery = useQuery({ queryKey: ["computerise-panel-agents", workspaceId], queryFn: () => paseo.agents.list({ page: { limit: 200 } }) });
@@ -52,12 +56,18 @@ export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePan
       <View style={styles.card}>
         <Text style={styles.heading}>{data.stopped ? "Stopped" : "Ready"}</Text>
         <Text style={styles.muted}>{data.holder ? `Screen lease: ${data.holder}` : "No agent is using the screen"}</Text>
-        {data.health.engineError ? (
-          <Text style={{ color: theme.colors.statusDanger }}>Engine: {data.health.engineError}</Text>
+        {!health ? (
+          <Text style={styles.muted}>{healthQuery.error ? `Permissions: ${errorText(healthQuery.error)}` : "Checking permissions"}</Text>
         ) : (
-          <Text style={data.health.accessibility === "missing" ? { color: theme.colors.statusWarning } : styles.muted}>Accessibility: {data.health.accessibility === "missing" ? "missing: grant it to Paseo" : "granted"}</Text>
+          <>
+            {health.engineError ? (
+              <Text style={{ color: theme.colors.statusDanger }}>Engine: {health.engineError}</Text>
+            ) : (
+              <Text style={health.accessibility === "missing" ? { color: theme.colors.statusWarning } : styles.muted}>Accessibility: {health.accessibility === "missing" ? "missing: grant it to Paseo" : "granted"}</Text>
+            )}
+            <Text style={health.screenRecording === "missing" ? { color: theme.colors.statusWarning } : styles.muted}>Screen Recording: {screenRecordingLabel(health.screenRecording)}</Text>
+          </>
         )}
-        <Text style={data.health.screenRecording === "missing" ? { color: theme.colors.statusWarning } : styles.muted}>Screen Recording: {screenRecordingLabel(data.health.screenRecording)}</Text>
         <View style={styles.row}>
           {data.stopped ? button("Resume computer use", () => stop.mutate(false), true, stop.isPending) : button("Stop all computer use", () => stop.mutate(true), true, stop.isPending)}
           {button("Refresh", () => void query.refetch(), false, query.isFetching)}

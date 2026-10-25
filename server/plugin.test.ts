@@ -276,11 +276,33 @@ describe("computerise server entry", () => {
 
   it("reports Accessibility, Screen Recording, and engine failures as panel health", async () => {
     const fake = start();
-    expect((await fake.call("computer.panel.status", {})).health).toEqual({ accessibility: "granted", screenRecording: "unknown", engineError: null });
+    expect(await fake.call("computer.panel.health", {})).toEqual({ accessibility: "granted", screenRecording: "unknown", engineError: null });
     fake.mac.screen.trusted = false;
     fake.mac.screen.screenRecording = "missing";
-    expect((await fake.call("computer.panel.status", {})).health).toEqual({ accessibility: "missing", screenRecording: "missing", engineError: null });
+    expect(await fake.call("computer.panel.health", {})).toEqual({ accessibility: "missing", screenRecording: "missing", engineError: null });
     fake.mac.screen.statusError = "The status script failed: The script host exited (code 1)";
-    expect((await fake.call("computer.panel.status", {})).health).toEqual({ accessibility: null, screenRecording: "missing", engineError: "The status script failed: The script host exited (code 1)" });
+    expect(await fake.call("computer.panel.health", {})).toEqual({ accessibility: null, screenRecording: "missing", engineError: "The status script failed: The script host exited (code 1)" });
+  });
+
+  it("answers panel status, including Stop, while the engine is busy", async () => {
+    const fake = start();
+    await fake.call("computer.status", {});
+    fake.mac.engine.status = () => new Promise(() => undefined);
+    const status = await Promise.race([fake.call("computer.panel.status", {}), new Promise((resolve) => setTimeout(() => resolve("timed out"), 500))]);
+    expect(status).toMatchObject({ stopped: false, pending: [] });
+    expect(await fake.call("computer.stop.set", { stopped: true })).toEqual({ stopped: true });
+  });
+
+  it("withdraws a pending approval when the agent's turn ends", async () => {
+    const fake = start();
+    const x = await createAgent(fake, "agent-x");
+    await fake.call("computer.mode.set", { agentId: "agent-x", mode: "ask" });
+    const client = await connect(x);
+    await callTool(client, "screenshot");
+    const pending = callTool(client, "click", { x: 400, y: 220 });
+    for (let i = 0; i < 200 && !fake.appended.some(({ row }) => row.data.status === "pending"); i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    await fake.turnEnded("agent-x");
+    expect((await pending).text).toContain("The request was withdrawn before it was answered");
+    expect(fake.mac.effects().map((effect) => effect.method)).toEqual(["screenshot"]);
   });
 });

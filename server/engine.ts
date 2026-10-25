@@ -54,7 +54,8 @@ const windowOwnerSchema = z.object({ pid: z.number().int(), name: z.string(), bu
 const postedSchema = z.object({ posted: z.literal(true) });
 const activateSchema = z.object({ running: z.boolean(), activated: z.boolean() });
 const appSchema = z.object({ bundleId: z.string(), path: z.string() }).nullable();
-const composedSchema = z.object({ drawn: z.number().int().nonnegative(), windows: z.number().int().nonnegative() });
+const windowsSchema = z.array(z.object({ id: z.number().int().positive(), x: z.number(), y: z.number(), width: z.number().positive(), height: z.number().positive() }));
+const writtenSchema = z.object({ written: z.literal(true) });
 const snapshotSchema = z.object({
   elements: z.array(
     z.object({
@@ -142,6 +143,11 @@ export class MacEngine {
     return result.data;
   }
 
+  // Stops the macOS step that is running, if the transport can.
+  interrupt(): void {
+    this.scripts.interrupt?.();
+  }
+
   // What the last capture showed; "unknown" until the first one.
   screenRecording(): ScreenRecording {
     return this.captureAccess;
@@ -192,18 +198,21 @@ export class MacEngine {
     await this.pointer({ action: "scroll", ...point, ...SCROLL_TICK[direction], ticks: amount }, point);
   }
 
-  async type(text: string): Promise<void> {
+  // receiver is the bundle id of the app the caller checked; keys stop if another app is in front.
+  async type(text: string, receiver: string): Promise<void> {
     if (text.length < 1 || text.length > LIMITS.typeUnits) throw new Error(`Expected 1 to ${LIMITS.typeUnits} characters to type, got ${text.length}`);
+    requireBundleId(receiver);
     await this.controllableDisplay();
     const units = Array.from({ length: text.length }, (_, i) => text.charCodeAt(i));
-    await this.script("keyboard", { kind: "text", units }, postedSchema, SCRIPT_TIMEOUT_MS + units.length * MS_PER_TYPED_UNIT);
+    await this.script("keyboard", { kind: "text", units, receiver }, postedSchema, SCRIPT_TIMEOUT_MS + units.length * MS_PER_TYPED_UNIT);
   }
 
-  async key(combo: string, repeat: number): Promise<void> {
+  async key(combo: string, repeat: number, receiver: string): Promise<void> {
     requireIntIn("key repeat", repeat, 1, LIMITS.keyRepeat);
     const { code, flags } = parseKeyCombo(combo);
+    requireBundleId(receiver);
     await this.controllableDisplay();
-    await this.script("keyboard", { kind: "key", code, flags, repeat }, postedSchema, SCRIPT_TIMEOUT_MS + repeat * MS_PER_KEY_PRESS);
+    await this.script("keyboard", { kind: "key", code, flags, repeat, receiver }, postedSchema, SCRIPT_TIMEOUT_MS + repeat * MS_PER_KEY_PRESS);
   }
 
   // Brings a running app forward. Callers re-read the screen afterwards: activation is not reliable.
@@ -252,22 +261,34 @@ export class MacEngine {
     return { jpeg, width: (x1 - x0) * display.scale, height: (y1 - y0) * display.scale };
   }
 
-  // Never falls back to a full-display capture: that would show what the user chose to hide.
+  // Never falls back to a full-display capture: that would show what the user chose to hide. Each
+  // window is captured on its own with screencapture -l, which never includes other apps' windows;
+  // CGWindowListCreateImage was used before and began blocking for every window (2026-10-25).
   private async composeWindows(pid: number, region: Region, scale: number): Promise<Buffer> {
     requireIntIn("process id", pid, 1, 2 ** 31 - 1);
+    const windows = await this.script("windowsOf", { pid }, windowsSchema);
+    if (windows.length === 0) throw new Error("The front app has no windows on screen to show");
     await mkdir(this.scratchDir, { recursive: true, mode: 0o700 });
     const out = join(this.scratchDir, `${randomUUID()}.jpg`);
+    const files: string[] = [];
     try {
-      const { drawn, windows } = await this.script("compose", { pid, region, scale, out }, composedSchema, CAPTURE_TIMEOUT_MS);
-      if (windows === 0) throw new Error("The front app has no windows on screen to show");
-      if (drawn === 0) {
-        this.captureAccess = "missing";
-        throw new Error("Paseo needs Screen Recording (System Settings > Privacy & Security > Screen Recording), then a Paseo reopen");
+      const layers = [];
+      for (const window of windows) {
+        const file = join(this.scratchDir, `${randomUUID()}.png`);
+        files.push(file);
+        try {
+          await this.run("screencapture", ["-x", "-o", "-l", String(window.id), "-t", "png", file], CAPTURE_TIMEOUT_MS);
+        } catch (error) {
+          // screencapture says the same when the window closed meanwhile, so the permission stays unknown.
+          throw new Error(`Could not capture window ${window.id} of the front app (${failureText(error)}): it closed, or Paseo lacks Screen Recording (System Settings > Privacy & Security > Screen Recording)`, { cause: error });
+        }
+        layers.push({ file, x: window.x, y: window.y, width: window.width, height: window.height });
       }
+      await this.script("compose", { region, scale, out, layers }, writtenSchema, CAPTURE_TIMEOUT_MS);
       this.captureAccess = "granted";
       return await readFile(out);
     } finally {
-      await rm(out, { force: true });
+      await Promise.all([out, ...files].map((file) => rm(file, { force: true })));
     }
   }
 

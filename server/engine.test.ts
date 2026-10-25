@@ -23,11 +23,21 @@ function scriptInput(call: Call): Record<string, unknown> {
 }
 
 // A stand-in for execFile that records every call and answers each script like macOS would.
-function fakeMac(options: { trusted?: boolean; cursorAfter?: (input: Record<string, unknown>) => { x: number; y: number }; composed?: { drawn: number; windows: number } } = {}) {
+const TEXTEDIT_WINDOW = { id: 7, x: 316, y: 159, width: 880, height: 448 };
+
+function fakeMac(
+  options: {
+    trusted?: boolean;
+    cursorAfter?: (input: Record<string, unknown>) => { x: number; y: number };
+    windows?: (typeof TEXTEDIT_WINDOW)[];
+    windowCaptureDenied?: boolean;
+  } = {},
+) {
   const calls: Call[] = [];
   const run: RunFile = async (file, args) => {
     calls.push({ file, args });
     if (file === "screencapture") {
+      if (args.includes("-l") && options.windowCaptureDenied) throw Object.assign(new Error("failed"), { stderr: "could not create image from window" });
       await writeFile(args[args.length - 1], "raw-jpeg");
       return "";
     }
@@ -46,9 +56,11 @@ function fakeMac(options: { trusted?: boolean; cursorAfter?: (input: Record<stri
       }
       case "keyboard":
         return JSON.stringify({ posted: true });
+      case "windowsOf":
+        return JSON.stringify(options.windows ?? [TEXTEDIT_WINDOW]);
       case "compose":
         await writeFile(input.out, "composed-jpeg");
-        return JSON.stringify(options.composed ?? { drawn: 1, windows: 1 });
+        return JSON.stringify({ written: true });
       default:
         throw new Error(`fakeMac has no answer for ${scriptName(args)}`);
     }
@@ -64,11 +76,12 @@ describe("passing model text to macOS", () => {
   it("sends typed text as one JSON argv entry to a fixed script, so quotes and $(...) are typed, never run", async () => {
     const mac = fakeMac();
     const text = 'He said "hi" \\ $(touch /tmp/pwned) `id` \' ; rm -rf ~\n 🙂';
-    await engineOn(mac).type(text);
+    await engineOn(mac).type(text, "com.apple.TextEdit");
     const keyboard = mac.calls.filter((call) => call.file === "osascript" && scriptName(call.args) === "keyboard");
     expect(keyboard).toHaveLength(1);
     expect(keyboard[0].args).toHaveLength(5);
     expect(keyboard[0].args.slice(0, 4)).toEqual(["-l", "JavaScript", "-e", SCRIPTS.keyboard]);
+    expect(scriptInput(keyboard[0]).receiver).toBe("com.apple.TextEdit");
     const units = scriptInput(keyboard[0]).units as number[];
     expect(String.fromCharCode(...units)).toBe(text);
     for (const source of Object.values(SCRIPTS)) expect(source).not.toContain("pwned");
@@ -77,8 +90,8 @@ describe("passing model text to macOS", () => {
   it("refuses empty text and text over 2000 UTF-16 units before touching macOS", async () => {
     const mac = fakeMac();
     const engine = engineOn(mac);
-    await expect(engine.type("")).rejects.toThrow("Expected 1 to 2000 characters to type, got 0");
-    await expect(engine.type("x".repeat(2001))).rejects.toThrow("Expected 1 to 2000 characters to type, got 2001");
+    await expect(engine.type("", "com.apple.TextEdit")).rejects.toThrow("Expected 1 to 2000 characters to type, got 0");
+    await expect(engine.type("x".repeat(2001), "com.apple.TextEdit")).rejects.toThrow("Expected 1 to 2000 characters to type, got 2001");
     expect(mac.calls).toHaveLength(0);
   });
 
@@ -109,8 +122,8 @@ describe("pointer and keyboard actions", () => {
       () => engine.move({ x: 10, y: 10 }),
       () => engine.drag({ x: 10, y: 10 }, { x: 20, y: 20 }),
       () => engine.scroll({ x: 10, y: 10 }, "down", 3),
-      () => engine.type("hello"),
-      () => engine.key("cmd+s", 1),
+      () => engine.type("hello", "com.apple.TextEdit"),
+      () => engine.key("cmd+s", 1, "com.apple.TextEdit"),
     ];
     for (const action of actions) await expect(action()).rejects.toThrow("Paseo needs Accessibility");
     expect(mac.calls.every((call) => scriptName(call.args) === "status")).toBe(true);
@@ -148,16 +161,16 @@ describe("pointer and keyboard actions", () => {
   it("refuses counts, repeats, and amounts outside their ranges", async () => {
     const engine = engineOn(fakeMac());
     await expect(engine.click({ x: 1, y: 1 }, { button: "left", count: 4, modifiers: [] })).rejects.toThrow("Expected click count 1 to 3, got 4");
-    await expect(engine.key("a", 0)).rejects.toThrow("Expected key repeat 1 to 20, got 0");
+    await expect(engine.key("a", 0, "com.apple.TextEdit")).rejects.toThrow("Expected key repeat 1 to 20, got 0");
     await expect(engine.scroll({ x: 1, y: 1 }, "up", 21)).rejects.toThrow("Expected scroll amount 1 to 20, got 21");
     await expect(engine.uiSnapshot(42, 401)).rejects.toThrow("Expected max elements 1 to 400, got 401");
   });
 
   it("presses a parsed key combination the given number of times", async () => {
     const mac = fakeMac();
-    await engineOn(mac).key("cmd+shift+t", 3);
+    await engineOn(mac).key("cmd+shift+t", 3, "com.apple.TextEdit");
     const keyboard = mac.calls.find((call) => scriptName(call.args) === "keyboard");
-    expect(scriptInput(keyboard!)).toEqual({ kind: "key", code: 17, flags: 0x100000 | 0x20000, repeat: 3 });
+    expect(scriptInput(keyboard!)).toEqual({ kind: "key", code: 17, flags: 0x100000 | 0x20000, repeat: 3, receiver: "com.apple.TextEdit" });
   });
 });
 
@@ -194,21 +207,29 @@ describe("capturing the screen", () => {
     const engine = engineOn(mac);
     const shot = await engine.screenshot(42);
     expect(shot).toEqual({ jpeg: Buffer.from("composed-jpeg"), width: 1512, height: 982 });
+    const listed = mac.calls.filter((call) => call.file === "osascript" && scriptName(call.args) === "windowsOf").map(scriptInput);
+    expect(listed).toEqual([{ pid: 42 }]);
+    const captures = mac.calls.filter((call) => call.file === "screencapture");
+    expect(captures.map((call) => call.args.slice(0, -1))).toEqual([["-x", "-o", "-l", "7", "-t", "png"]]);
+    const windowFile = captures[0].args.at(-1) as string;
     const composed = mac.calls.filter((call) => call.file === "osascript" && scriptName(call.args) === "compose").map(scriptInput);
-    expect(composed).toEqual([{ pid: 42, region: [0, 0, 1512, 982], scale: 1, out: expect.any(String) }]);
+    expect(composed).toEqual([{ region: [0, 0, 1512, 982], scale: 1, out: expect.any(String), layers: [{ file: windowFile, x: 316, y: 159, width: 880, height: 448 }] }]);
     expect(existsSync(composed[0].out as string)).toBe(false);
-    expect(mac.calls.some((call) => call.file === "screencapture" || call.file === "sips")).toBe(false);
+    expect(existsSync(windowFile)).toBe(false);
+    expect(mac.calls.some((call) => call.file === "sips")).toBe(false);
 
     const zoomed = await engine.zoom([100, 100, 300, 200], 42);
     expect(zoomed).toEqual({ jpeg: Buffer.from("composed-jpeg"), width: 400, height: 200 });
-    expect(scriptInput(mac.calls.filter((call) => call.file === "osascript" && scriptName(call.args) === "compose")[1])).toMatchObject({ pid: 42, region: [100, 100, 300, 200], scale: 2 });
+    expect(scriptInput(mac.calls.filter((call) => call.file === "osascript" && scriptName(call.args) === "compose")[1])).toMatchObject({ region: [100, 100, 300, 200], scale: 2 });
   });
 
-  it("never falls back to the full display when one app's windows cannot be drawn", async () => {
-    const blank = engineOn(fakeMac({ composed: { drawn: 0, windows: 2 } }));
-    await expect(blank.screenshot(42)).rejects.toThrow("Paseo needs Screen Recording");
-    expect(blank.screenRecording()).toBe("missing");
-    const windowless = fakeMac({ composed: { drawn: 0, windows: 0 } });
+  it("never falls back to the full display when one app's windows cannot be captured", async () => {
+    const denied = fakeMac({ windowCaptureDenied: true });
+    const blank = engineOn(denied);
+    await expect(blank.screenshot(42)).rejects.toThrow("Could not capture window 7 of the front app (could not create image from window): it closed, or Paseo lacks Screen Recording");
+    expect(blank.screenRecording()).toBe("unknown");
+    expect(denied.calls.some((call) => call.file === "screencapture" && call.args.includes("-m"))).toBe(false);
+    const windowless = fakeMac({ windows: [] });
     await expect(engineOn(windowless).screenshot(42)).rejects.toThrow("The front app has no windows on screen to show");
     expect(windowless.calls.some((call) => call.file === "screencapture")).toBe(false);
   });

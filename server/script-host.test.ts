@@ -71,6 +71,21 @@ describe.runIf(process.platform === "darwin")("the long-lived script host", () =
     expect(replies.join("")).toBe('{"id":1,"out":"{\\"done\\":true}"}\n');
   });
 
+  it("carries non-ASCII text intact when a request spans several pipe reads", async () => {
+    host = new ScriptHost(TEST_SCRIPTS);
+    const text = "é🙂".repeat(40_000);
+    expect(JSON.parse(await host.run("echo", { text }, 10_000)).text).toBe(text);
+  });
+
+  it("fails the running request when interrupted, then starts a new host for the next call", async () => {
+    host = new ScriptHost(TEST_SCRIPTS);
+    const before = await host.run("pid", {}, 5_000);
+    const long = host.run("sleep", { seconds: 5 }, 10_000);
+    setTimeout(() => host.interrupt(), 200);
+    await expect(long).rejects.toThrow("Interrupted because computer use was stopped");
+    expect(await host.run("pid", {}, 5_000)).not.toBe(before);
+  });
+
   it("refuses an unknown script name without asking the host", async () => {
     host = new ScriptHost(TEST_SCRIPTS);
     await expect(host.run("missing" as never, {}, 5_000)).rejects.toThrow('Unknown script "missing"');

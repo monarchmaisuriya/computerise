@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { z } from "zod";
-import { answerApprovalRpc, APPROVAL_ROW_KIND, computerSettings, type healthSchema, panelScreenshotRpc, panelStatusRpc, type Settings, setModeRpc, setStopRpc, statusRpc } from "../shared/contracts";
+import { answerApprovalRpc, APPROVAL_ROW_KIND, computerSettings, type healthSchema, panelHealthRpc, panelScreenshotRpc, panelStatusRpc, type Settings, setModeRpc, setStopRpc, statusRpc } from "../shared/contracts";
 import { Approvals, ApprovalScopes } from "./approvals";
 import { AuditLog } from "./audit";
 import { MacEngine, runFile } from "./engine";
@@ -211,7 +211,8 @@ export function contributeComputer(server: PluginServerContext, options: Compute
   const releaseLease = async ({ agent }: { agent: { id: string } }, { paseo: api }: { paseo: PaseoApi }) => {
     remember(api);
     if (!runtime) return;
-    const { lease, scopes } = await runtime;
+    const { lease, scopes, approvals } = await runtime;
+    approvals.cancelFor(agent.id);
     lease.release(agent.id);
     scopes.clear(agent.id);
   };
@@ -220,7 +221,8 @@ export function contributeComputer(server: PluginServerContext, options: Compute
   server.on("agent.archived", async ({ agent }, { paseo: api }) => {
     remember(api);
     if (!runtime) return;
-    const { lease, calls, rates, seats, control, scopes } = await runtime;
+    const { lease, calls, rates, seats, control, scopes, approvals } = await runtime;
+    approvals.cancelFor(agent.id);
     lease.release(agent.id);
     scopes.clear(agent.id);
     calls.release(agent.id);
@@ -231,7 +233,8 @@ export function contributeComputer(server: PluginServerContext, options: Compute
 
   server.handle(setModeRpc, async ({ agentId, mode }, { paseo: api }) => {
     remember(api);
-    const { control, scopes } = await requireRuntime();
+    const { control, scopes, approvals } = await requireRuntime();
+    approvals.cancelFor(agentId);
     scopes.clear(agentId);
     await control.setMode(agentId, mode);
     return { mode };
@@ -255,8 +258,13 @@ export function contributeComputer(server: PluginServerContext, options: Compute
 
   server.handle(panelStatusRpc, async (_input, { paseo: api }) => {
     remember(api);
-    const { control, lease, approvals, panel, engine } = await requireRuntime();
-    return { stopped: control.stopped(), modes: control.modes(), holder: lease.holderId(), pending: approvals.listPending(), ...panel.snapshot(), health: await health(engine) };
+    const { control, lease, approvals, panel } = await requireRuntime();
+    return { stopped: control.stopped(), modes: control.modes(), holder: lease.holderId(), pending: approvals.listPending(), ...panel.snapshot() };
+  });
+
+  server.handle(panelHealthRpc, async (_input, { paseo: api }) => {
+    remember(api);
+    return health((await requireRuntime()).engine);
   });
 
   server.handle(panelScreenshotRpc, async ({ id }, { paseo: api }) => {

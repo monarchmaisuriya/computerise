@@ -43,6 +43,7 @@ describe("the computer MCP endpoint", () => {
   let control: ControlStore;
   let approvals: Approvals;
   let scopes: ApprovalScopes;
+  let lease: Lease;
   let rows: { agentId: string; row: ApprovalRow }[];
   let auditPath: string;
   let computer: ComputerMcp;
@@ -61,6 +62,7 @@ describe("the computer MCP endpoint", () => {
     rows = [];
     approvals = new Approvals({ show: async (agentId, _rowId, row) => void rows.push({ agentId, row }) }, async () => 2_000);
     scopes = new ApprovalScopes();
+    lease = new Lease(120_000);
     auditPath = join(root, "audit.jsonl");
     panel = new PanelState();
     currentSettings = settingsSchema.parse({});
@@ -69,7 +71,7 @@ describe("the computer MCP endpoint", () => {
       tokens,
       seats,
       control,
-      lease: new Lease(120_000),
+      lease,
       calls: new RateLimiter(120, 60_000),
       rates: new RateLimiter(60, 60_000),
       failsafe: new Failsafe(),
@@ -219,7 +221,7 @@ describe("the computer MCP endpoint", () => {
     const typed = await call(client, "type", { text: "hunter2!" });
     expect(typed.isError).toBe(false);
     expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot", "type"]);
-    expect(mac.calls.find((effect) => effect.method === "type")?.args).toEqual(["hunter2!"]);
+    expect(mac.calls.find((effect) => effect.method === "type")?.args).toEqual(["hunter2!", "com.apple.TextEdit"]);
     expect(rows).toEqual([]);
     const audit = await readFile(auditPath, "utf8");
     expect(audit).toContain('"chars":8');
@@ -371,6 +373,50 @@ describe("the computer MCP endpoint", () => {
     expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot", "click", "scroll", "move"]);
   });
 
+  it("refuses an approved action when the agent lost the screen while waiting", async () => {
+    const client = await agent("agent-x", "ask");
+    await call(client, "screenshot");
+    const pending = call(client, "click", { x: 400, y: 220 });
+    const row = await nextRow(1);
+    lease.release("agent-x");
+    approvals.answer(row.row.requestId, "agent-x", true);
+    expect((await pending).text).toContain("The screen was released while this action waited");
+    expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot"]);
+  });
+
+  it("interrupts the running macOS step when the user stops computer use", async () => {
+    await computer.stopAll();
+    expect(mac.calls.map((entry) => entry.method)).toContain("interrupt");
+  });
+
+  it("tells the keyboard which app it checked, so keys stop if another app comes to the front", async () => {
+    const client = await agent("agent-x", "auto");
+    await call(client, "screenshot");
+    await call(client, "type", { text: "hi" });
+    await call(client, "key", { keys: "cmd+s" });
+    expect(mac.effects().filter((effect) => effect.method === "type" || effect.method === "key").map((effect) => effect.args.at(-1))).toEqual(["com.apple.TextEdit", "com.apple.TextEdit"]);
+  });
+
+  it.each([
+    ["the agent is turned off", async () => control.setMode("agent-x", "off"), "Computer use is off for this agent"],
+    ["the user stops computer use", async () => computer.stopAll(), "Computer use is stopped by the user"],
+    ["the user pushes the pointer into the corner", async () => void (mac.screen.cursor = { x: 0, y: 0 }), "The pointer is in the top-left corner"],
+  ])("sends no screenshot after an action when %s during it", async (_case, happen, reason) => {
+    const client = await agent("agent-x", "auto");
+    await call(client, "screenshot");
+    const click = mac.engine.click;
+    mac.engine.click = async (...args) => {
+      await click(...args);
+      await happen();
+    };
+    const result = await call(client, "click", { x: 400, y: 220, screenshot: true });
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain("Done: click left at (400, 220) on TextEdit");
+    expect(result.text).toContain(`No screenshot: ${reason}`);
+    expect(result.content.filter((part) => part.type === "image")).toHaveLength(0);
+    expect(mac.effects().filter((effect) => effect.method === "screenshot")).toHaveLength(1);
+  });
+
   it("forgets apps allowed for the turn when the user stops computer use", async () => {
     const client = await agent("agent-x", "ask");
     await call(client, "screenshot");
@@ -435,7 +481,7 @@ describe("the computer MCP endpoint", () => {
     const stoppedWhileWaiting = call(client, "click");
     await nextRow(2);
     await computer.stopAll();
-    expect((await stoppedWhileWaiting).text).toContain("Computer use was stopped by the user");
+    expect((await stoppedWhileWaiting).text).toContain("The request was withdrawn before it was answered");
     expect(rows.map((shown) => shown.row.status)).toEqual(["pending", "allowed", "pending", "cancelled"]);
     expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot"]);
   });

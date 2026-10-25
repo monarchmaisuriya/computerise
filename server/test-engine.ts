@@ -61,10 +61,11 @@ export function fakeEngine() {
       return { jpeg: Buffer.from("zoomed"), width: 200, height: 200 };
     },
     screenRecording: () => screen.screenRecording,
+    interrupt: () => void calls.push({ method: "interrupt", args: [] }),
     uiSnapshot: async (pid, max) => {
       calls.push({ method: "uiSnapshot", args: [pid, max] });
       return { elements: [{ role: "AXTextArea", label: null, value: "hello", frame: [10, 20, 300, 400] }], cut: false };
     },
   };
-  return { engine, screen, calls, effects: () => calls.filter((call) => !["status", "windowAt", "resolveApp"].includes(call.method)) };
+  return { engine, screen, calls, effects: () => calls.filter((call) => !["status", "windowAt", "resolveApp", "interrupt"].includes(call.method)) };
 }

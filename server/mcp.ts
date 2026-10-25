@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import type { Mode, Settings } from "../shared/contracts";
-import type { Approvals, ApprovalScopes } from "./approvals";
+import { type Approvals, type ApprovalScopes, singleApp } from "./approvals";
 import type { AuditLog } from "./audit";
 import { LIMITS, type MacEngine, type MouseButton, type Point, type ScreenStatus, type ScrollDirection } from "./engine";
 import { type AppRef, blockLevel, type ControlStore, type Failsafe, type Lease, LeaseHeldError, type RateLimiter } from "./policy";
@@ -30,7 +30,7 @@ const STOPPED = "Computer use is stopped by the user; they can resume it from th
 
 export type Engine = Pick<
   MacEngine,
-  "status" | "windowAt" | "activate" | "resolveApp" | "openApp" | "click" | "move" | "drag" | "scroll" | "type" | "key" | "screenshot" | "zoom" | "uiSnapshot" | "screenRecording"
+  "status" | "windowAt" | "activate" | "resolveApp" | "openApp" | "click" | "move" | "drag" | "scroll" | "type" | "key" | "screenshot" | "zoom" | "uiSnapshot" | "screenRecording" | "interrupt"
 >;
 
 export interface ComputerMcpOptions {
@@ -106,11 +106,10 @@ function appLabel(app: AppRef): string {
   return `${app.name} (${app.bundleId ?? "unknown app"})`;
 }
 
-// The one identifiable app that receives every part of an action, or null.
-function singleApp(apps: AppRef[]): { bundleId: string; name: string } | null {
-  const [first] = apps;
-  if (!first || first.bundleId === null || apps.some((app) => app.bundleId !== first.bundleId)) return null;
-  return { bundleId: first.bundleId, name: first.name };
+// The blocklist already refuses an app without a bundle id, so this only fails if that check moved.
+function receiverId(app: AppRef | undefined): string {
+  if (!app?.bundleId) throw new Refusal("No identifiable app is in front to receive the keys");
+  return app.bundleId;
 }
 
 function sameApps(a: AppRef[], b: AppRef[]): boolean {
@@ -162,6 +161,7 @@ export class ComputerMcp {
     this.options.approvals.cancelAll();
     this.options.scopes.clearAll();
     this.options.lease.releaseAll();
+    this.options.engine.interrupt();
     if (persistenceError) throw persistenceError;
   }
 
@@ -228,11 +228,12 @@ export class ComputerMcp {
       const decision = await approvals.request(agentId, description, [...new Set(planned.map((app) => app.name))].join(", "), scopeApp?.name ?? null);
       if (decision === "deny") throw new Refusal("The user denied this action");
       if (decision === "timeout") throw new Refusal("The user did not answer in time; nothing was done");
-      if (decision === "cancelled") throw new Refusal("Computer use was stopped by the user");
+      if (decision === "cancelled") throw new Refusal("The request was withdrawn before it was answered (Stop, a mode change, or the end of the agent's turn); nothing was done");
       this.requireRunning(agentId);
       if (decision === "allow-app" && scopeApp) scopes.allow(agentId, scopeApp.bundleId);
     }
     return this.exclusive(async () => {
+      if (lease.holderId() !== agentId) throw new Refusal("The screen was released while this action waited (for example, the agent's turn ended); take a new screenshot");
       if (spec.needsWorkingApp && working !== null) await this.bringForward(working);
       const actual = await spec.receivers(args, working, "actual");
       if (!sameApps(planned, actual)) throw new Refusal("The screen changed while waiting; take a new screenshot");
@@ -250,15 +251,17 @@ export class ComputerMcp {
     });
   }
 
-  // The action already happened, so a refused or failed screenshot is reported, not raised. It is
-  // audited as its own screenshot, like one the agent asked for separately.
+  // The action already happened, so a refused or failed screenshot is reported, not raised. It passes
+  // the same stop, mode, rate, corner, and lease checks as a screenshot the agent asked for
+  // separately, and is audited as one.
   private async screenshotAfterAction(agentId: string): Promise<Content[]> {
-    const { engine, audit, panel } = this.options;
+    const { audit, panel, calls } = this.options;
     await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
     let target: string | null = null;
     try {
-      const status = await engine.status();
-      const result = await this.read(agentId, this.screenshotSpec, {}, status, await this.options.settings());
+      const mode = this.requireRunning(agentId);
+      calls.take(agentId);
+      const result = await this.onScreen(agentId, mode, this.screenshotSpec, {});
       target = result.target;
       await audit.record({ agentId, tool: "screenshot", target, outcome: "ok" });
       panel?.activity({ agentId, tool: "screenshot", target, outcome: "ok" });
@@ -464,7 +467,7 @@ export class ComputerMcp {
       needsWorkingApp: true,
       receivers: keyboardReceivers,
       describe: ({ text }) => `type ${shownText(text)}`,
-      act: ({ text }) => engine.type(text),
+      act: ({ text }, [app]) => engine.type(text, receiverId(app)),
       chars: ({ text }) => text.length,
     });
 
@@ -478,7 +481,7 @@ export class ComputerMcp {
         needsWorkingApp: true,
         receivers: keyboardReceivers,
         describe: ({ keys, repeat = 1 }) => `press ${keys}${repeat > 1 ? ` x${repeat}` : ""}`,
-        act: ({ keys, repeat = 1 }) => engine.key(keys, repeat),
+        act: ({ keys, repeat = 1 }, [app]) => engine.key(keys, repeat, receiverId(app)),
       },
     );
 

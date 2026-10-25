@@ -4,7 +4,7 @@
 
 Computer use for any Paseo agent on macOS. Computerise gives Claude, Codex, OpenCode, and other MCP-capable agents tools to see and control the Mac running the Paseo daemon.
 
-Current release: **v0.3.0**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
+Current release: **v0.3.1**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
 
 ## What it provides
 
@@ -44,7 +44,7 @@ In an agent composer:
 /computer status
 ```
 
-The composer pill and the **Computer** workspace panel provide the same controls. Ask mode requires approval for every input action; read-only screenshots and accessibility snapshots do not ask again after access is enabled. For clicks, moves, drags, and scrolls, **Allow <app> this turn** also allows later pointer actions in that same app until the agent's turn ends; typing, key presses, and opening apps always ask.
+The composer pill and the **Computer** workspace panel provide the same controls. Ask mode requires approval for every input action; read-only screenshots and accessibility snapshots do not ask again after access is enabled. For clicks, moves, drags, and scrolls, **Allow <app> this turn** also allows later pointer actions in that same app until the agent's turn ends; typing, key presses, opening apps, and drags between two apps always ask. Requests still waiting when the turn ends, the agent closes, or its mode changes are withdrawn.
 
 ## Security model
 

@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, describe, expect, it } from "vitest";
 import { MacEngine, runFile } from "./engine";
@@ -37,15 +39,25 @@ describe.runIf(process.env.COMPUTERISE_LIVE === "1")("the engine on this Mac", (
     expect((await engine.status()).front?.bundleId).toBe(await freshFront());
   });
 
+  // Opens a document, not the bare app: capturing TextEdit while it is still opening its Open panel
+  // blocked macOS's window capture for over 10 seconds (2026-10-25), which the plugin reports as a
+  // failed call.
   it("captures only the front app's windows at display size", async () => {
     const before = (await engine.status()).front?.bundleId as string;
-    await bringForward("com.apple.TextEdit");
+    const document = join(tempDir("computerise-live-doc-"), "capture-check.txt");
+    await writeFile(document, "computerise live capture check\n");
+    await promisify(execFile)("open", ["-b", "com.apple.TextEdit", document]);
+    await sleep(1_500);
     const { front, display } = await engine.status();
     const shot = await engine.screenshot(front?.pid as number);
     await bringForward(before);
     expect(shot.jpeg.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
     expect({ width: shot.width, height: shot.height }).toEqual({ width: display.width, height: display.height });
     expect(engine.screenRecording()).toBe("granted");
+  });
+
+  it("refuses to type when the front app is not the one checked, before posting a key", async () => {
+    await expect(engine.type("x", "com.example.not-in-front")).rejects.toThrow("is in front instead of com.example.not-in-front; typing stopped after 0 of 1 characters");
   });
 
   it("posts pointer input through the host", async () => {

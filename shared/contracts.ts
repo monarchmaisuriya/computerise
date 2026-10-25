@@ -112,7 +112,13 @@ export const panelStatusRpc = defineRpc({
     holder: z.string().nullable(),
     pending: z.array(approvalRowSchema.extend({ agentId: z.string() })),
     screenshot: screenshotInfoSchema.nullable(),
-    health: healthSchema,
     recent: z.array(activitySchema).max(25),
   }),
+});
+
+// Separate from panel status, so Stop, modes, and approvals never wait behind a long engine call.
+export const panelHealthRpc = defineRpc({
+  name: "computer.panel.health",
+  input: z.object({}),
+  output: healthSchema,
 });

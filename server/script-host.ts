@@ -6,6 +6,8 @@ import type { RunFile } from "./engine";
 // How the engine runs its fixed JXA programs. The output is the program's JSON text.
 export interface ScriptRunner {
   run(name: ScriptName, input: object, timeoutMs: number): Promise<string>;
+  // Fails the running request and anything queued behind it.
+  interrupt?(): void;
 }
 
 // One new osascript per call. The input is always a JSON object, so it starts with "{" and
@@ -15,6 +17,12 @@ export function perCallScripts(run: RunFile): ScriptRunner {
 }
 
 const STDERR_KEPT = 2_000;
+
+// The host decodes each pipe read on its own, so a character split across two reads would be lost.
+// Escaping everything outside ASCII keeps every byte a whole character.
+function asciiJson(value: object): string {
+  return JSON.stringify(value).replace(/[\u0080-\uffff]/g, (unit) => `\\u${unit.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
 
 type Request = { id: number; name: string; input: object; timeoutMs: number; resolve(out: string): void; reject(error: Error): void };
 
@@ -50,13 +58,17 @@ export class ScriptHost<Name extends string> {
     this.drop(new Error("The script host is closed"));
   }
 
+  interrupt(): void {
+    this.drop(new Error("Interrupted because computer use was stopped"));
+  }
+
   private sendNext(): void {
     if (this.running || this.queue.length === 0) return;
     const request = this.queue.shift() as Request;
     const child = this.current();
     const timer = setTimeout(() => this.drop(new Error(`The ${request.name} script did not answer within ${request.timeoutMs} ms; the script host was restarted`)), request.timeoutMs);
     this.running = { request, timer };
-    child.stdin.write(`${JSON.stringify({ id: request.id, name: request.name, input: request.input })}\n`);
+    child.stdin.write(`${asciiJson({ id: request.id, name: request.name, input: request.input })}\n`);
   }
 
   private current(): ChildProcessWithoutNullStreams {
@@ -67,9 +79,11 @@ export class ScriptHost<Name extends string> {
     const fromThisHost = (handle: () => void) => () => {
       if (this.child === child) handle();
     };
-    child.stderr.setEncoding("utf8").on("data", (text: string) => {
-      this.stderr = (this.stderr + text).slice(-STDERR_KEPT);
-    });
+    child.stderr.setEncoding("utf8").on("data", (text: string) =>
+      fromThisHost(() => {
+        this.stderr = (this.stderr + text).slice(-STDERR_KEPT);
+      })(),
+    );
     createInterface({ input: child.stdout }).on("line", (line) => fromThisHost(() => this.answer(line))());
     child.on("error", (error) => fromThisHost(() => this.drop(new Error(`The script host could not run: ${error.message}`)))());
     child.on("exit", (code, signal) => fromThisHost(() => this.drop(new Error(`The script host exited (${signal ?? `code ${code}`})${this.stderr.trim() ? `: ${this.stderr.trim()}` : ""}`)))());

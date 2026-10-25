@@ -165,6 +165,21 @@ describe("approvals", () => {
   });
 });
 
+describe("withdrawing one agent's approvals", () => {
+  it("cancels only that agent's pending rows", async () => {
+    const rows = fakeRows();
+    const approvals = new Approvals(rows.rows, async () => 45_000);
+    const mine = approvals.request("agent-x", "click", "TextEdit");
+    const theirs = approvals.request("agent-y", "click", "Notes");
+    await settle();
+    approvals.cancelFor("agent-x");
+    expect(await mine).toBe("cancelled");
+    expect(approvals.listPending().map((row) => row.agentId)).toEqual(["agent-y"]);
+    approvals.answer(approvals.listPending()[0].requestId, "agent-y", false);
+    expect(await theirs).toBe("deny");
+  });
+});
+
 describe("apps allowed for the rest of a turn", () => {
   it("covers an action only when every receiving app is allowed for that agent", () => {
     const scopes = new ApprovalScopes();
@@ -173,6 +188,9 @@ describe("apps allowed for the rest of a turn", () => {
     scopes.allow("agent-x", "com.apple.TextEdit");
     expect(scopes.covers("agent-x", [textEdit])).toBe(true);
     expect(scopes.covers("agent-x", [textEdit, notes])).toBe(false);
+    scopes.allow("agent-x", "com.apple.Notes");
+    expect(scopes.covers("agent-x", [textEdit, notes])).toBe(false);
+    expect(scopes.covers("agent-x", [notes, notes])).toBe(true);
     expect(scopes.covers("agent-y", [textEdit])).toBe(false);
     expect(scopes.covers("agent-x", [])).toBe(false);
     expect(scopes.covers("agent-x", [{ bundleId: null, name: "Unknown" }])).toBe(false);

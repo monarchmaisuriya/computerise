@@ -97,9 +97,19 @@ function run(argv) {
 }`;
 
 // Text goes as one UTF-16 unit per key event, which typed emoji and quotes exactly in the spike.
+// Keys go to whichever app is in front, so the app the caller checked is checked again before the
+// first key and every few keys after it: if the user brings another app forward mid-typing (say a
+// terminal), the rest is never posted. The error names the app and counts keys, never the text.
 const keyboard = String.raw`
+ObjC.import('AppKit');
 ObjC.import('CoreGraphics');
-var HID_TAP = 0;
+var HID_TAP = 0, CHECK_EVERY = 20;
+function requireReceiver(receiver, done, total, what) {
+  $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.001));
+  var app = $.NSWorkspace.sharedWorkspace.frontmostApplication;
+  var front = app.isNil() ? null : (ObjC.unwrap(app.bundleIdentifier) || null);
+  if (front !== receiver) throw new Error((front || 'No app') + ' is in front instead of ' + receiver + '; ' + what + ' stopped after ' + done + ' of ' + total + (what === 'typing' ? ' characters' : ' presses'));
+}
 function postKey(code, down, flags, unit) {
   var e = $.CGEventCreateKeyboardEvent(null, code, down);
   if (unit !== undefined) {
@@ -114,12 +124,14 @@ function run(argv) {
   var a = JSON.parse(argv[0]);
   if (a.kind === 'text') {
     for (var i = 0; i < a.units.length; i++) {
+      if (i % CHECK_EVERY === 0) requireReceiver(a.receiver, i, a.units.length, 'typing');
       postKey(0, true, 0, a.units[i]);
       postKey(0, false, 0, a.units[i]);
       delay(0.01);
     }
   } else if (a.kind === 'key') {
     for (var r = 0; r < a.repeat; r++) {
+      requireReceiver(a.receiver, r, a.repeat, 'key presses');
       postKey(a.code, true, a.flags);
       postKey(a.code, false, a.flags);
       delay(0.03);
@@ -216,43 +228,49 @@ function run(argv) {
   return JSON.stringify({ elements: elements, cut: cut });
 }`;
 
-// Draws every on-screen window of one process onto a black canvas covering a region of the main
-// display, at the windows' real positions, so a coordinate read off the image is still the point to
-// click. Other apps' windows never reach the image. Windows are drawn back to front. The canvas has
-// its origin at the bottom left, while window bounds have theirs at the top left. Prints how many
-// of the process's windows were drawn: none drawn of some means macOS refused the capture.
-const compose = String.raw`
-ObjC.import('AppKit');
+// The on-screen windows of one process, back to front, with their bounds in points.
+const windowsOf = String.raw`
 ObjC.import('CoreGraphics');
 function run(argv) {
   var a = JSON.parse(argv[0]);
-  var x0 = a.region[0], y0 = a.region[1], width = (a.region[2] - x0) * a.scale, height = (a.region[3] - y0) * a.scale;
-  var onScreenOnly = 1, excludeDesktop = 16, includingWindow = 8, ignoreFraming = 1;
+  var onScreenOnly = 1, excludeDesktop = 16;
   var windows = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(onScreenOnly | excludeDesktop, 0)));
+  var mine = [];
+  for (var i = windows.length - 1; i >= 0; i--) {
+    var w = windows[i], b = w.kCGWindowBounds;
+    if (w.kCGWindowOwnerPID !== a.pid || b.Width < 1 || b.Height < 1) continue;
+    mine.push({ id: w.kCGWindowNumber, x: b.X, y: b.Y, width: b.Width, height: b.Height });
+  }
+  return JSON.stringify(mine);
+}`;
+
+// Draws already-captured window images onto a black canvas covering a region of the main display,
+// at the windows' real positions, so a coordinate read off the image is still the point to click.
+// The canvas has its origin at the bottom left, while window bounds have theirs at the top left.
+const compose = String.raw`
+ObjC.import('AppKit');
+function run(argv) {
+  var a = JSON.parse(argv[0]);
+  var x0 = a.region[0], y0 = a.region[1], width = (a.region[2] - x0) * a.scale, height = (a.region[3] - y0) * a.scale;
   var rep = $.NSBitmapImageRep.alloc.initWithBitmapDataPlanesPixelsWidePixelsHighBitsPerSampleSamplesPerPixelHasAlphaIsPlanarColorSpaceNameBytesPerRowBitsPerPixel(null, width, height, 8, 4, true, false, $.NSDeviceRGBColorSpace, 0, 0);
-  var context = $.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep);
+  var sourceOver = 2, wholeImage = { origin: { x: 0, y: 0 }, size: { width: 0, height: 0 } };
   $.NSGraphicsContext.saveGraphicsState;
-  $.NSGraphicsContext.setCurrentContext(context);
+  $.NSGraphicsContext.setCurrentContext($.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep));
   $.NSColor.blackColor.setFill;
   $.NSRectFill({ origin: { x: 0, y: 0 }, size: { width: width, height: height } });
-  var drawn = 0, owned = 0;
-  for (var i = windows.length - 1; i >= 0; i--) {
-    var w = windows[i];
-    if (w.kCGWindowOwnerPID !== a.pid) continue;
-    owned++;
-    var image = $.CGWindowListCreateImage({ origin: { x: Infinity, y: Infinity }, size: { width: 0, height: 0 } }, includingWindow, w.kCGWindowNumber, ignoreFraming);
-    if (!image) continue;
-    var b = w.kCGWindowBounds;
-    $.CGContextDrawImage(context.CGContext, { origin: { x: (b.X - x0) * a.scale, y: height - (b.Y - y0 + b.Height) * a.scale }, size: { width: b.Width * a.scale, height: b.Height * a.scale } }, image);
-    drawn++;
+  for (var i = 0; i < a.layers.length; i++) {
+    var l = a.layers[i];
+    var image = $.NSImage.alloc.initWithContentsOfFile(l.file);
+    if (image.isNil()) throw new Error('Could not read the captured image of a window');
+    image.drawInRectFromRectOperationFraction({ origin: { x: (l.x - x0) * a.scale, y: height - (l.y - y0 + l.height) * a.scale }, size: { width: l.width * a.scale, height: l.height * a.scale } }, wholeImage, sourceOver, 1);
   }
   $.NSGraphicsContext.restoreGraphicsState;
   var jpeg = 3;
   rep.representationUsingTypeProperties(jpeg, $({ NSImageCompressionFactor: 0.7 })).writeToFileAtomically(a.out, true);
-  return JSON.stringify({ drawn: drawn, windows: owned });
+  return JSON.stringify({ written: true });
 }`;
 
-export const SCRIPTS = { status, windowAt, pointer, keyboard, activate, resolveApp, uiSnapshot, compose } as const;
+export const SCRIPTS = { status, windowAt, pointer, keyboard, activate, resolveApp, uiSnapshot, windowsOf, compose } as const;
 export type ScriptName = keyof typeof SCRIPTS;
 
 // One long-lived osascript that runs the fixed programs above on request, so each call costs about

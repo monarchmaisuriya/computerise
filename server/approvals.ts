@@ -64,6 +64,11 @@ export class Approvals {
     for (const requestId of [...this.pending.keys()]) this.finish(requestId, "cancelled");
   }
 
+  // Withdraws an agent's open requests when its turn ends, it closes, or its mode changes.
+  cancelFor(agentId: string): void {
+    for (const [requestId, pending] of [...this.pending.entries()]) if (pending.agentId === agentId) this.finish(requestId, "cancelled");
+  }
+
   listPending(): Array<ApprovalRow & { agentId: string }> {
     return [...this.pending.values()].map(({ agentId, row }) => ({ agentId, ...row }));
   }
@@ -80,6 +85,14 @@ export class Approvals {
   }
 }
 
+// The one identifiable app that receives every part of an action, or null. Both offering and using
+// "Allow <app> this turn" go through this, so an action across two apps always asks.
+export function singleApp(apps: readonly AppRef[]): { bundleId: string; name: string } | null {
+  const [first] = apps;
+  if (!first || first.bundleId === null || apps.some((app) => app.bundleId !== first.bundleId)) return null;
+  return { bundleId: first.bundleId, name: first.name };
+}
+
 // Apps each agent may use pointer actions in without asking, until its turn ends. The plugin clears
 // an agent's apps on turn end, close, archive, and any mode change, and every agent's on Stop.
 export class ApprovalScopes {
@@ -92,8 +105,8 @@ export class ApprovalScopes {
   }
 
   covers(agentId: string, receivers: readonly AppRef[]): boolean {
-    const apps = this.apps.get(agentId);
-    return apps !== undefined && receivers.length > 0 && receivers.every((app) => app.bundleId !== null && apps.has(app.bundleId));
+    const app = singleApp(receivers);
+    return app !== null && (this.apps.get(agentId)?.has(app.bundleId) ?? false);
   }
 
   clear(agentId: string): void {

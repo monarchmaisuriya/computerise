@@ -30,7 +30,7 @@ Current release: **v0.4.0**. Computerise follows [Semantic Versioning](https://s
 ## Requirements
 
 - macOS
-- Paseo `>=0.13.0 <0.14.0`
+- Paseo 0.13.0 or later
 - **Accessibility** permission for Paseo
 - **Screen & System Audio Recording** permission for Paseo
 

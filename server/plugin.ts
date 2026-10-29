@@ -24,6 +24,12 @@ const LEASE_IDLE_MS = 120_000;
 const ACTIONS_PER_MINUTE = 60;
 const CALLS_PER_MINUTE = 120;
 const MINUTE_MS = 60_000;
+// Where Paseo records a child agent's parent (getParentAgentIdFromLabels in @getpaseo/protocol,
+// which plugin code cannot import at runtime).
+const PARENT_AGENT_LABEL = "paseo.parent-agent-id";
+
+// Paseo 0.14 passes the new agent's labels to session_open; the 0.13 SDK types do not declare them.
+type SessionOpenLabels = { labels?: Record<string, string> };
 
 const PROMPT_SECTION = [
   PROMPT_SECTION_START,
@@ -83,6 +89,14 @@ export function contributeComputer(server: PluginServerContext, options: Compute
     return computerSettings.schema.parse({});
   }
 
+  // The defaults would drop the apps the user blocked, so tools that see or touch the screen refuse
+  // instead. The port and the approval timeout still fall back to their defaults.
+  async function toolSettings(): Promise<Settings> {
+    const state = await settings.read();
+    if (state.status === "ready") return state.values;
+    throw new Error(`The Computerise settings are invalid (${state.error}); the user can fix them in the plugin settings. Nothing was done`);
+  }
+
   // MCP calls arrive outside any hook, so the plugin keeps the latest Paseo handle a hook or RPC
   // gave it. Every agent passes through a hook (create, or session_open on resume) before it can call.
   let paseo: PaseoApi | null = null;
@@ -103,6 +117,9 @@ export function contributeComputer(server: PluginServerContext, options: Compute
     const seats = await Seats.open(join(root, "seats.json"));
     const control = await ControlStore.open(join(root, "control.json"));
     for (const problem of [seats.problem, control.problem]) if (problem) console.error(`[computerise] ${problem}; starting with nothing allowed`);
+    await control
+      .keepExistingAgentsOff(seats.agents())
+      .catch((error: unknown) => console.error(`[computerise] could not save Off for existing agents (${String(error)}); they are off until the next start repeats it`));
     const lease = new Lease(LEASE_IDLE_MS);
     const calls = new RateLimiter(CALLS_PER_MINUTE, MINUTE_MS);
     const rates = new RateLimiter(ACTIONS_PER_MINUTE, MINUTE_MS);
@@ -135,7 +152,7 @@ export function contributeComputer(server: PluginServerContext, options: Compute
       elements,
       audit: new AuditLog(join(root, "audit.jsonl")),
       panel,
-      settings: currentSettings,
+      settings: toolSettings,
       agentTitle,
     });
     const base = { computer, engine, tokens, seats, control, lease, calls, rates, approvals, scopes, elements, panel, host };
@@ -192,16 +209,34 @@ export function contributeComputer(server: PluginServerContext, options: Compute
     }
   });
 
+  // Unsaved agents start in ask mode, so a child of an Off agent would otherwise see more than its
+  // parent. The agent is not registered yet during session_open, so its parent comes from the
+  // labels in the request; without them, the agent starts Off.
+  function startsOff(control: ControlStore, agentId: string, { labels }: SessionOpenLabels): boolean {
+    if (!labels) {
+      console.error(`[computerise] Paseo did not pass the labels of agent ${agentId}, so its parent is unknown; it starts with computer use off`);
+      return true;
+    }
+    const parentId = labels[PARENT_AGENT_LABEL]?.trim();
+    return Boolean(parentId) && control.mode(parentId) === "off";
+  }
+
   // The seat set at creation reaches session_open only when reason is "create" (checked in the spike).
+  // The mode is saved before the seat is bound, so the agent's first call already sees it.
   server.before("agent.session_open", async ({ request }, { paseo: api }) => {
     remember(api);
     const seat = request.env[SEAT_ENV];
     if (!runtime || request.reason !== "create" || !seat) return;
-    const { seats } = await runtime;
-    await seats
-      .bind(seat, request.agentId)
-      .catch((error: unknown) => console.error(`[computerise] seat for agent ${request.agentId} was not bound (${String(error)}); its computer tools answer "not ready"`));
+    const { seats, control } = await runtime;
+    try {
+      if (startsOff(control, request.agentId, request as SessionOpenLabels)) await control.setMode(request.agentId, "off");
+      await seats.bind(seat, request.agentId);
+    } catch (error) {
+      console.error(`[computerise] seat for agent ${request.agentId} was not bound (${String(error)}); its computer tools answer "not ready"`);
+    }
   });
+
+  const effectiveModes = (seats: Seats, control: ControlStore) => Object.fromEntries(seats.agents().map((agentId) => [agentId, control.mode(agentId)]));
 
   // The plugin asks the user itself in ask mode, so the CLI's own prompt for these tools would ask
   // twice. Claude names the tool mcp__<server>__<tool>; Codex names only the server.
@@ -254,8 +289,8 @@ export function contributeComputer(server: PluginServerContext, options: Compute
 
   server.handle(statusRpc, async (_input, { paseo: api }) => {
     remember(api);
-    const { control, lease } = await requireRuntime();
-    return { stopped: control.stopped(), modes: control.modes(), holder: lease.holderId() };
+    const { control, lease, seats } = await requireRuntime();
+    return { stopped: control.stopped(), modes: effectiveModes(seats, control), holder: lease.holderId() };
   });
 
   // Reads status outside the tool pipeline: it changes nothing and lets the panel show why tools fail.
@@ -270,8 +305,8 @@ export function contributeComputer(server: PluginServerContext, options: Compute
 
   server.handle(panelStatusRpc, async (_input, { paseo: api }) => {
     remember(api);
-    const { control, lease, approvals, panel } = await requireRuntime();
-    return { stopped: control.stopped(), modes: control.modes(), holder: lease.holderId(), pending: approvals.listPending(), ...panel.snapshot() };
+    const { control, lease, approvals, panel, seats } = await requireRuntime();
+    return { stopped: control.stopped(), modes: effectiveModes(seats, control), holder: lease.holderId(), pending: approvals.listPending(), ...panel.snapshot() };
   });
 
   server.handle(panelHealthRpc, async (_input, { paseo: api }) => {

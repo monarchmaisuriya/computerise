@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -499,6 +499,42 @@ describe("the computer MCP endpoint", () => {
     const again = call(client, "click", { x: 400, y: 220 });
     approvals.answer((await nextRow(2)).row.requestId, "agent-x", false);
     expect((await again).text).toContain("The user denied this action");
+  });
+
+  it("refuses an action queued in auto when the agent is switched to ask before it runs", async () => {
+    const client = await agent("agent-x", "auto");
+    await call(client, "screenshot");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const click = mac.engine.click;
+    let held = false;
+    mac.engine.click = async (...args: Parameters<typeof click>) => {
+      if (!held) {
+        held = true;
+        await gate;
+      }
+      return click(...args);
+    };
+    const first = call(client, "click", { x: 400, y: 220 });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const second = call(client, "click", { x: 401, y: 221 });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await control.setMode("agent-x", "ask");
+    release();
+    expect((await first).isError).toBe(false);
+    expect(await second).toMatchObject({ isError: true, text: "The agent was switched to ask mode while this action waited; nothing was done" });
+    expect(mac.calls.filter((entry) => entry.method === "click")).toHaveLength(1);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("reports an action that ran as done even when its audit write fails", async () => {
+    await mkdir(auditPath);
+    const client = await agent("agent-x", "auto");
+    expect((await call(client, "screenshot")).isError).toBe(false);
+    const result = await call(client, "click", { x: 400, y: 220 });
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain("Done: click left at (400, 220) on TextEdit");
+    expect(mac.calls.filter((entry) => entry.method === "click")).toHaveLength(1);
   });
 
   it("in ask mode does nothing when the user denies or does not answer", async () => {

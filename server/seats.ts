@@ -31,6 +31,11 @@ export class Seats {
     return Object.hasOwn(this.bindings, seat) ? this.bindings[seat] : null;
   }
 
+  // Every agent that has the computer tools.
+  agents(): string[] {
+    return [...new Set(Object.values(this.bindings))];
+  }
+
   bind(seat: string, agentId: string): Promise<void> {
     const write = this.writes.then(async () => {
       const bound = this.agentFor(seat);

@@ -38,10 +38,15 @@ export function describeElement(element: Element): string {
   return `${element.role ?? "unknown"}${element.label ? ` ${JSON.stringify(element.label)}` : ""}`;
 }
 
-// Value is left out: typing into a field must not make the field a different control.
+// Roles whose value is what the user types. Typing into one must not make it a different control.
+const EDITABLE_ROLES = new Set(["AXTextField", "AXTextArea", "AXComboBox"]);
+
+// Unlabelled rows, cells, and text are told apart only by their value, so a row whose message was
+// replaced at the same position is a different control.
 function sameControl(a: Element, b: Element): boolean {
   const position = (frame: Element["frame"]) => frame?.map(Math.round) ?? null;
-  return a.role === b.role && a.label === b.label && JSON.stringify(position(a.frame)) === JSON.stringify(position(b.frame));
+  const sameValue = (a.role !== null && EDITABLE_ROLES.has(a.role)) || a.value === b.value;
+  return a.role === b.role && a.label === b.label && sameValue && JSON.stringify(position(a.frame)) === JSON.stringify(position(b.frame));
 }
 
 export function pickElement(table: ElementTable | undefined, number: number): { expected: ExpectedElement } | { refusal: string } {

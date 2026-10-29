@@ -2,7 +2,7 @@
   "id": "computerise",
   "name": "Computerise",
   "icon": "computerise.png",
-  "description": "Desktop computer use for any Paseo agent, off until you turn it on per agent.",
+  "description": "Desktop computer use for any Paseo agent, asking before each input action unless you change an agent's mode.",
   "requirements": {
     "paseo": ">=0.13.0"
   },

@@ -90,7 +90,8 @@ export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePan
         {agentQuery.isPending && <Text style={styles.muted}>Loading agents</Text>}
         {agentQuery.data?.entries.filter(({ agent }) => agent.workspaceId === workspaceId).length === 0 && <Text style={styles.muted}>No agents in this workspace.</Text>}
         {agentQuery.data?.entries.filter(({ agent }) => agent.workspaceId === workspaceId).map(({ agent }) => {
-          const mode = data.modes[agent.id] ?? "off";
+          if (!Object.hasOwn(data.modes, agent.id)) return <Text key={agent.id} style={styles.muted}>{agent.title ?? agent.id}: no computer tools; agents get them when they are created while Computerise is on</Text>;
+          const mode = data.modes[agent.id];
           return <View key={agent.id} style={{ gap: 6 }}>
             <Text style={styles.text}>{agent.title ?? agent.id}: {modeLabel(mode)}</Text>
             <View style={styles.row}>

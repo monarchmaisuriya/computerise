@@ -15,7 +15,9 @@ function run() {
     bundleId: ObjC.unwrap(app.bundleIdentifier) || null,
     pid: app.processIdentifier
   };
-  var screen = $.NSScreen.mainScreen;
+  // The display screencapture -m captures and point coordinates start on; mainScreen is the one
+  // with keyboard focus, which on several displays may be another.
+  var screen = $.NSScreen.screens.objectAtIndex(0);
   return JSON.stringify({
     trusted: $.AXIsProcessTrusted(),
     cursor: { x: p.x, y: p.y },
@@ -275,7 +277,7 @@ function run(argv) {
   }
   $.NSGraphicsContext.restoreGraphicsState;
   var jpeg = 3;
-  rep.representationUsingTypeProperties(jpeg, $({ NSImageCompressionFactor: 0.7 })).writeToFileAtomically(a.out, true);
+  if (!rep.representationUsingTypeProperties(jpeg, $({ NSImageCompressionFactor: 0.7 })).writeToFileAtomically(a.out, true)) throw new Error('Could not write the composed screenshot');
   return JSON.stringify({ written: true });
 }`;
 

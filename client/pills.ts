@@ -18,7 +18,12 @@ export function contributePills(client: PluginClientContext) {
     if (disposed) return;
     const status = await client.rpc(statusRpc, {});
     for (const agent of agents.values()) {
-      const mode = status.modes[agent.id] ?? "off";
+      if (!Object.hasOwn(status.modes, agent.id)) {
+        pills.get(agent.id)?.remove();
+        pills.delete(agent.id);
+        continue;
+      }
+      const mode = status.modes[agent.id];
       const set = (next: Mode) => async () => {
         await client.rpc(setModeRpc, { agentId: agent.id, mode: next });
         await refresh();
@@ -37,6 +42,7 @@ export function contributePills(client: PluginClientContext) {
       else pills.set(agent.id, client.addComposerPill({ id: "computer-mode", workspaceId: agent.workspaceId, agentId: agent.id, button }));
     }
   };
+  const refreshNow = () => void refresh().catch((error: unknown) => !disposed && console.error("Computerise could not refresh the composer controls", error));
   const remove = (agentId: string) => {
     agents.delete(agentId);
     pills.get(agentId)?.remove();
@@ -48,17 +54,17 @@ export function contributePills(client: PluginClientContext) {
       snapshot({ entries }) {
         for (const agentId of [...agents.keys()]) remove(agentId);
         for (const { agent } of entries) if (agent.workspaceId) agents.set(agent.id, { id: agent.id, workspaceId: agent.workspaceId });
-        void refresh();
+        refreshNow();
       },
       update(message) {
         if (message.type !== "agent_update") return;
         const update = message.payload;
         if (update.kind === "upsert" && update.agent.workspaceId) agents.set(update.agent.id, { id: update.agent.id, workspaceId: update.agent.workspaceId });
         else if (update.kind === "remove") remove(update.agentId);
-        void refresh();
+        refreshNow();
       },
     });
-    timer = setInterval(() => void refresh().catch(() => undefined), 2_000);
+    timer = setInterval(refreshNow, 2_000);
   }).catch((error: unknown) => !disposed && console.error("Computerise could not observe agents", error));
 
   return () => {

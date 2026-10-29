@@ -19,6 +19,18 @@ describe("approvals", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
+  it("withdraws a request cancelled while its timeout setting is still being read", async () => {
+    const rows = fakeRows();
+    let timeoutRead!: (ms: number) => void;
+    const approvals = new Approvals(rows.rows, () => new Promise<number>((resolve) => (timeoutRead = resolve)));
+    const decision = approvals.request("agent-x", "click left at (400, 220)", "TextEdit");
+    await settle();
+    approvals.cancelFor("agent-x");
+    timeoutRead(45_000);
+    expect(await decision).toBe("cancelled");
+    expect(approvals.listPending()).toEqual([]);
+  });
+
   it("shows a pending row and resolves allow or deny when the user answers, updating the same row", async () => {
     const rows = fakeRows();
     const approvals = new Approvals(rows.rows, async () => 45_000);

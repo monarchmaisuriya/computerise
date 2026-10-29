@@ -3,6 +3,9 @@ import { type Mode, modeSchema, type Settings } from "../shared/contracts";
 import { BUILT_IN_BLOCKS, PASEO_BUNDLE_ID } from "../shared/blocks";
 import { readJsonFile, writeJsonFile } from "./json-file";
 
+// The mode of an agent the user has not set one for.
+export const DEFAULT_MODE: Mode = "ask";
+
 export type BlockLevel = "none" | "no-input" | "no-view";
 export type AppRef = { bundleId: string | null; name: string };
 export type Point = { x: number; y: number };
@@ -115,7 +118,9 @@ export class Failsafe {
   }
 }
 
-const controlSchema = z.object({ modes: z.record(z.string(), modeSchema), stopped: z.boolean() });
+// version 2: an agent without a saved mode is in DEFAULT_MODE. Files without it are older, when
+// such an agent was off.
+const controlSchema = z.object({ version: z.literal(2).optional(), modes: z.record(z.string(), modeSchema), stopped: z.boolean() });
 type Control = z.infer<typeof controlSchema>;
 
 // Per-agent modes and the global stop, kept on disk so a restart or crash loop cannot clear a stop.
@@ -135,7 +140,7 @@ export class ControlStore {
   }
 
   mode(agentId: string): Mode {
-    return Object.hasOwn(this.state.modes, agentId) ? this.state.modes[agentId] : "off";
+    return Object.hasOwn(this.state.modes, agentId) ? this.state.modes[agentId] : DEFAULT_MODE;
   }
 
   stopped(): boolean {
@@ -153,6 +158,14 @@ export class ControlStore {
 
   setStopped(stopped: boolean): Promise<void> {
     return this.save((current) => ({ ...current, stopped }), stopped);
+  }
+
+  // Saves Off for every agent that already has the tools and no saved mode, once, so an upgrade or an
+  // unreadable file never gives an existing agent more access; only agents created later start in
+  // DEFAULT_MODE. Applied in memory even if the write fails, and repeated on the next start.
+  keepExistingAgentsOff(agentIds: readonly string[]): Promise<void> {
+    if (this.state.version === 2) return Promise.resolve();
+    return this.save((current) => ({ ...current, version: 2, modes: { ...Object.fromEntries(agentIds.map((agentId) => [agentId, "off" as const])), ...current.modes } }), true);
   }
 
   removeAgent(agentId: string): Promise<void> {

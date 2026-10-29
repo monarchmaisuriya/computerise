@@ -1,6 +1,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { APPROVAL_ROW_KIND, type Settings, settingsSchema } from "../shared/contracts";
 import { SERVER_NAME } from "./mcp";
@@ -19,8 +21,9 @@ function fakeServer(values: Settings) {
   const before = new Map<string, Handler>();
   const on = new Map<string, Handler>();
   const rpc = new Map<string, Handler>();
+  const settings: { state: { status: "ready"; revision: string; values: Settings } | { status: "invalid"; revision: string; error: string } } = { state: { status: "ready", revision: "1", values } };
   const server = {
-    registerSettings: () => ({ read: async () => ({ status: "ready", revision: "1", values }), subscribe: () => () => undefined }),
+    registerSettings: () => ({ read: async () => settings.state, subscribe: () => () => undefined }),
     before: (name: string, handler: Handler) => before.set(name, handler),
     on: (name: string, handler: Handler) => on.set(name, handler),
     handle: (contract: { name: string }, handler: Handler) => rpc.set(contract.name, handler),
@@ -43,13 +46,15 @@ function fakeServer(values: Settings) {
   const fire = (name: string, event: unknown) => (on.get(name) as (event: unknown, context: unknown) => Promise<void>)(event, { paseo });
   return {
     server,
+    settings,
     appended,
     respondToPermission,
     create: (config: Record<string, unknown>, env?: Record<string, string>) =>
       (before.get("agent.create") as (input: unknown, context: unknown) => Promise<{ config: Record<string, any>; env?: Record<string, string> }>)({ request: { config, ...(env ? { env } : {}) } }, { paseo }),
-    sessionOpen: (agentId: string, reason: string, env: Record<string, string>) =>
+    // labels: what Paseo 0.14 passes (a child's names its parent); null leaves them out, as the 0.13 types do.
+    sessionOpen: (agentId: string, reason: string, env: Record<string, string>, labels: Record<string, string> | null = {}) =>
       (before.get("agent.session_open") as (input: unknown, context: unknown) => Promise<unknown>)(
-        { request: { agentId, workspaceId: "ws-1", provider: "claude", cwd: "/tmp", reason, purpose: "interactive", env } },
+        { request: { agentId, workspaceId: "ws-1", provider: "claude", cwd: "/tmp", reason, purpose: "interactive", title: null, ...(labels ? { labels } : {}), tools: [], mcpServers: {}, env } },
         { paseo },
       ),
     permission: (request: Record<string, unknown>) => fire("agent.permission_requested", { agent: agent("agent-1"), request }),
@@ -76,18 +81,19 @@ describe("computerise server entry", () => {
     cleanup = () => undefined;
   });
 
-  function start(platform: NodeJS.Platform = "darwin") {
+  function start(platform: NodeJS.Platform = "darwin", prepare: (root: string) => void = () => undefined) {
     const fake = fakeServer(defaults);
     const mac = fakeEngine();
     const root = tempDir("computerise-plugin-");
+    prepare(root);
     cleanup = contributeComputer(fake.server, { resolveRoot: async () => root, platform, makeEngine: () => mac.engine }) as () => unknown;
     return { ...fake, mac };
   }
 
   // Creates an agent the way Paseo does: the create hook, then session_open with the env it set.
-  async function createAgent(fake: ReturnType<typeof start>, agentId: string, config: Record<string, unknown> = { provider: "claude", cwd: "/tmp" }) {
+  async function createAgent(fake: ReturnType<typeof start>, agentId: string, config: Record<string, unknown> = { provider: "claude", cwd: "/tmp" }, labels: Record<string, string> | null = {}) {
     const created = await fake.create(config);
-    await fake.sessionOpen(agentId, "create", created.env ?? {});
+    await fake.sessionOpen(agentId, "create", created.env ?? {}, labels);
     return created;
   }
 
@@ -147,9 +153,11 @@ describe("computerise server entry", () => {
     await fake.sessionOpen("agent-x", "create", created.env ?? {});
     await fake.sessionOpen("agent-y", "create", created.env ?? {});
     const after = await connect(created);
+    expect((await callTool(after, "screenshot")).isError).toBe(false);
+    await fake.call("computer.mode.set", { agentId: "agent-y", mode: "off" });
+    expect((await callTool(after, "screenshot")).isError).toBe(false);
+    await fake.call("computer.mode.set", { agentId: "agent-x", mode: "off" });
     expect((await callTool(after, "screenshot")).text).toBe("Computer use is off for this agent; the user can turn it on with /computer ask");
-    await fake.call("computer.mode.set", { agentId: "agent-y", mode: "auto" });
-    expect((await callTool(after, "screenshot")).isError).toBe(true);
   });
 
   it("approves this server's tools for Claude and Codex and leaves other servers to the user", async () => {
@@ -207,6 +215,38 @@ describe("computerise server entry", () => {
     expect(await fake.call("computer.status", {})).toEqual({ stopped: false, modes: {}, holder: null });
   });
 
+  it("starts a new agent in ask mode, and a child of an Off agent, or one whose labels Paseo left out, off", async () => {
+    const fake = start();
+    const config = { provider: "claude", cwd: "/tmp" };
+    await createAgent(fake, "parent");
+    await fake.call("computer.mode.set", { agentId: "parent", mode: "off" });
+    await createAgent(fake, "child", config, { "paseo.parent-agent-id": "parent" });
+    await createAgent(fake, "auto-parent");
+    await fake.call("computer.mode.set", { agentId: "auto-parent", mode: "auto" });
+    await createAgent(fake, "auto-child", config, { "paseo.parent-agent-id": "auto-parent" });
+    await createAgent(fake, "unknown", config, null);
+    expect((await fake.call("computer.status", {})).modes).toEqual({ parent: "off", child: "off", "auto-parent": "auto", "auto-child": "ask", unknown: "off" });
+  });
+
+  it("keeps an agent from before the upgrade off and starts one created after it in ask", async () => {
+    const fake = start("darwin", (root) => {
+      writeFileSync(join(root, "seats.json"), JSON.stringify({ "seat-old": "agent-old" }));
+      writeFileSync(join(root, "control.json"), JSON.stringify({ modes: {}, stopped: false }));
+    });
+    await createAgent(fake, "agent-new");
+    expect(await fake.call("computer.status", {})).toEqual({ stopped: false, modes: { "agent-old": "off", "agent-new": "ask" }, holder: null });
+  });
+
+  it("refuses screen tools while the settings are invalid, instead of acting without the user's blocked apps", async () => {
+    const fake = start();
+    const client = await connect(await createAgent(fake, "agent-x"));
+    fake.settings.state = { status: "invalid", revision: "2", error: "extraNoView: expected array" };
+    const result = await callTool(client, "screenshot");
+    expect(result).toEqual({ isError: true, text: "The Computerise settings are invalid (extraNoView: expected array); the user can fix them in the plugin settings. Nothing was done" });
+    expect(fake.mac.calls.map((entry) => entry.method)).not.toContain("screenshot");
+    expect((await callTool(client, "status")).isError).toBe(false);
+  });
+
   it("shows approval rows in the agent's chat and takes the answer through the RPC", async () => {
     const fake = start();
     const x = await createAgent(fake, "agent-x");
@@ -227,8 +267,9 @@ describe("computerise server entry", () => {
 
   it("reports and changes modes and the global stop through RPCs", async () => {
     const fake = start();
-    const x = await createAgent(fake, "agent-x");
     expect(await fake.call("computer.status", {})).toEqual({ stopped: false, modes: {}, holder: null });
+    const x = await createAgent(fake, "agent-x");
+    expect(await fake.call("computer.status", {})).toEqual({ stopped: false, modes: { "agent-x": "ask" }, holder: null });
     await fake.call("computer.mode.set", { agentId: "agent-x", mode: "auto" });
     const client = await connect(x);
     await callTool(client, "screenshot");

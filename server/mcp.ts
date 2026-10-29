@@ -31,6 +31,10 @@ const NOT_READY = "Computer use is not ready for this agent yet; try again in a 
 const STOPPED = "Computer use is stopped by the user; they can resume it from the Computer panel";
 const ELEMENT_OR_POINT = "Give either element, or both x and y";
 
+function auditFailed(error: unknown): void {
+  console.error(`[computerise] audit write failed: ${String(error)}`);
+}
+
 export type Engine = Pick<
   MacEngine,
   "status" | "windowAt" | "activate" | "resolveApp" | "openApp" | "click" | "move" | "drag" | "scroll" | "type" | "key" | "screenshot" | "zoom" | "uiSnapshot" | "screenRecording" | "interrupt" | "openPrivacySettings" | "promptAccessibility" | "checkScreenRecording"
@@ -296,6 +300,9 @@ export class ComputerMcp {
       if (decision === "allow-app" && scopeApp) scopes.allow(agentId, scopeApp.bundleId);
     }
     return this.exclusive(async () => {
+      // Before anything touches the Mac. An action queued in auto was never approved, so a switch to
+      // ask while it waited refuses it.
+      if (this.requireRunning(agentId) === "ask" && mode === "auto") throw new Refusal("The agent was switched to ask mode while this action waited; nothing was done");
       if (lease.holderId() !== agentId) throw new Refusal("The screen was released while this action waited (for example, the agent's turn ended); take a new screenshot");
       if (spec.needsWorkingApp && working !== null) await this.bringForward(working);
       const actual = await spec.target(agentId, args, working, planned);
@@ -329,13 +336,13 @@ export class ComputerMcp {
       if (tool === "screenshot") calls.take(agentId);
       const result = await this.onScreen(agentId, mode, spec, {}, true);
       target = result.target;
-      await audit.record({ agentId, tool, target, outcome: "ok" });
+      await audit.record({ agentId, tool, target, outcome: "ok" }).catch(auditFailed);
       panel?.activity({ agentId, tool, target, outcome: "ok" });
       return result.content;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const outcome = error instanceof Refusal ? `refused: ${message}` : `error: ${message}`;
-      await audit.record({ agentId, tool, target, outcome }).catch((auditError: unknown) => console.error(`[computerise] audit write failed: ${String(auditError)}`));
+      await audit.record({ agentId, tool, target, outcome }).catch(auditFailed);
       panel?.activity({ agentId, tool, target, outcome });
       return textContent(`${refusal}: ${message}`);
     }
@@ -414,7 +421,8 @@ export class ComputerMcp {
       const result =
         spec.kind === "pause" ? { content: await spec.run(args), target: null } : spec.kind === "info" ? { content: await spec.run(agentId), target: null } : await this.onScreen(agentId, mode, spec, args);
       target = result.target;
-      await audit.record({ agentId, tool, target, outcome: "ok", chars });
+      // The tool already ran, so a failed audit write must not tell the agent it failed (it would retry).
+      await audit.record({ agentId, tool, target, outcome: "ok", chars }).catch(auditFailed);
       this.options.panel?.activity({ agentId, tool, target, outcome: "ok", chars });
       if (!result.observed) return { content: result.content };
       await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
@@ -425,7 +433,7 @@ export class ComputerMcp {
       const message = error instanceof Error ? error.message : String(error);
       const outcome = error instanceof Refusal ? `refused: ${message}` : `error: ${message}`;
       const recordedOutcome = tool === "type" ? (error instanceof Refusal ? "refused" : "error") : outcome;
-      await audit.record({ agentId, tool, target, outcome: recordedOutcome, chars }).catch((auditError: unknown) => console.error(`[computerise] audit write failed: ${String(auditError)}`));
+      await audit.record({ agentId, tool, target, outcome: recordedOutcome, chars }).catch(auditFailed);
       this.options.panel?.activity({ agentId, tool, target, outcome: recordedOutcome, chars });
       return { content: textContent(message), isError: true };
     }

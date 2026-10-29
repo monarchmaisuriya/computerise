@@ -37,9 +37,16 @@ describe("picking an element by number", () => {
 describe("matching the picked element against a fresh read", () => {
   const expected = { number: 2, pid: 42, app: TEXTEDIT, max: 200, element: SAVE };
 
-  it("accepts the same control even when its value changed", () => {
-    const live = { elements: [{ ...FIELD, value: "abc" }, { ...SAVE, value: "x" }], cut: false };
-    expect(matchLive(expected, live)).toEqual({ element: { ...SAVE, value: "x" } });
+  it("accepts a text field whose typed value changed", () => {
+    const field = { ...expected, number: 1, element: FIELD };
+    const live = { elements: [{ ...FIELD, value: "abc" }, SAVE], cut: false };
+    expect(matchLive(field, live)).toEqual({ element: { ...FIELD, value: "abc" } });
+  });
+
+  it("refuses an unlabelled row at the same position whose content changed", () => {
+    const row = { role: "AXRow", label: null, value: "Invoice from Alice", frame: [0, 300, 400, 20] as [number, number, number, number] };
+    const picked = { ...expected, number: 1, element: row };
+    expect(matchLive(picked, { elements: [{ ...row, value: "Wire transfer request" }], cut: false })).toHaveProperty("refusal");
   });
 
   it("treats sub-point frame differences as the same position", () => {

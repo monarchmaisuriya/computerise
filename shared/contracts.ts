@@ -35,6 +35,8 @@ export const setModeRpc = defineRpc({
   output: z.object({ mode: modeSchema }),
 });
 
+// modes holds the mode the server enforces for every agent that has the computer tools; an agent
+// missing from it has none.
 export const statusRpc = defineRpc({
   name: "computer.status",
   input: z.object({}),

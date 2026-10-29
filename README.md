@@ -4,7 +4,7 @@
 
 Computer use for any Paseo agent on macOS. Computerise gives Claude, Codex, OpenCode, and other MCP-capable agents tools to see and control the Mac running the Paseo daemon.
 
-Current release: **v0.4.0**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
+Current release: **v0.5.0**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
 
 ## What it provides
 
@@ -47,11 +47,11 @@ In an agent composer:
 /computer status
 ```
 
-The composer pill and the **Computer** workspace panel provide the same controls. Ask mode requires approval for every input action; read-only screenshots and accessibility snapshots do not ask again after access is enabled. For clicks, moves, drags, and scrolls, **Allow <app> this turn** also allows later pointer actions in that same app until the agent's turn ends; typing, key presses, opening apps, and drags between two apps always ask. Requests still waiting when the turn ends, the agent closes, or its mode changes are withdrawn.
+The composer pill and the **Computer** workspace panel provide the same controls. New agents start in ask mode; agents that had the computer tools before v0.5.0 stay off until you choose a mode, and a child of an agent that is off starts off. Ask mode requires approval for every input action; read-only screenshots and accessibility snapshots never ask. For clicks, moves, drags, and scrolls, **Allow <app> this turn** also allows later pointer actions in that same app until the agent's turn ends; typing, key presses, opening apps, and drags between two apps always ask. Requests still waiting when the turn ends, the agent closes, or its mode changes are withdrawn.
 
 ## Security model
 
-Computer use is off by default. Screenshots and accessibility snapshots are returned to the agent and therefore sent to that agent's model provider. Enabling desktop control weakens a provider's command or filesystem sandbox because the agent can operate signed-in desktop applications with the macOS user's permissions.
+New agents start in ask mode, so they can take screenshots and accessibility snapshots without asking; use `/computer off` for an agent that should not see the screen. Screenshots and accessibility snapshots are returned to the agent and therefore sent to that agent's model provider. If the saved modes cannot be read, every agent that already has the computer tools is set to off. While the plugin settings are invalid, tools that see or touch the screen refuse. Enabling desktop control weakens a provider's command or filesystem sandbox because the agent can operate signed-in desktop applications with the macOS user's permissions.
 
 Ask mode helps prevent mistakes and prompt-injected actions, but it is not a security boundary against an already-hostile agent with arbitrary local command access. See [OVERVIEW.md](OVERVIEW.md) for the complete safety and data notes.
 

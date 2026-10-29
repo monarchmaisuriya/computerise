@@ -155,27 +155,50 @@ describe("the corner failsafe", () => {
 });
 
 describe("modes and the global stop", () => {
-  it("defaults every agent to off and keeps modes and the stop across reopening", async () => {
+  it("defaults every agent to ask and keeps modes and the stop across reopening", async () => {
     const path = join(tempDir("computerise-control-"), "control.json");
     const control = await ControlStore.open(path);
-    expect(control.mode("agent-x")).toBe("off");
+    expect(control.mode("agent-x")).toBe("ask");
     expect(control.stopped()).toBe(false);
-    await control.setMode("agent-x", "ask");
+    await control.setMode("agent-x", "off");
     await control.setStopped(true);
     const reopened = await ControlStore.open(path);
-    expect(reopened.mode("agent-x")).toBe("ask");
-    expect(reopened.mode("agent-y")).toBe("off");
+    expect(reopened.mode("agent-x")).toBe("off");
+    expect(reopened.mode("agent-y")).toBe("ask");
     expect(reopened.stopped()).toBe(true);
   });
 
-  it("turns every agent off when the file cannot be read, and says why", async () => {
+  it("keeps agents that already have the tools off after an upgrade, once, and starts new agents in ask", async () => {
+    const path = join(tempDir("computerise-control-"), "control.json");
+    await writeFile(path, JSON.stringify({ modes: { "agent-auto": "auto" }, stopped: false }));
+    const control = await ControlStore.open(path);
+    await control.keepExistingAgentsOff(["agent-old", "agent-auto"]);
+    expect(control.modes()).toEqual({ "agent-old": "off", "agent-auto": "auto" });
+    expect(control.mode("agent-new")).toBe("ask");
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ version: 2, modes: { "agent-old": "off", "agent-auto": "auto" }, stopped: false });
+
+    await control.setMode("agent-old", "ask");
+    const reopened = await ControlStore.open(path);
+    await reopened.keepExistingAgentsOff(["agent-old", "agent-auto", "agent-later"]);
+    expect(reopened.modes()).toEqual({ "agent-old": "ask", "agent-auto": "auto" });
+  });
+
+  it("turns every agent that has the tools off when the file cannot be read, and says why", async () => {
     const path = join(tempDir("computerise-control-"), "control.json");
     await writeFile(path, "{ not json");
     const control = await ControlStore.open(path);
-    expect(control.mode("agent-x")).toBe("off");
     expect(control.problem).toMatch(/control.json could not be read/);
-    await control.setMode("agent-x", "auto");
-    expect(JSON.parse(await readFile(path, "utf8")).modes).toEqual({ "agent-x": "auto" });
+    await control.keepExistingAgentsOff(["agent-x"]);
+    expect(control.mode("agent-x")).toBe("off");
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual({ version: 2, modes: { "agent-x": "off" }, stopped: false });
+  });
+
+  it("applies the upgrade's Off in memory even when it cannot be saved", async () => {
+    const path = join(tempDir("computerise-control-upgrade-fail-"), "control.json");
+    const control = await ControlStore.open(path);
+    await mkdir(path);
+    await expect(control.keepExistingAgentsOff(["agent-x"])).rejects.toThrow();
+    expect(control.mode("agent-x")).toBe("off");
   });
 
   it("removes an archived agent's saved mode", async () => {
@@ -183,8 +206,8 @@ describe("modes and the global stop", () => {
     const control = await ControlStore.open(path);
     await control.setMode("agent-x", "auto");
     await control.removeAgent("agent-x");
-    expect(control.mode("agent-x")).toBe("off");
-    expect((await ControlStore.open(path)).mode("agent-x")).toBe("off");
+    expect(control.modes()).toEqual({});
+    expect((await ControlStore.open(path)).modes()).toEqual({});
   });
 
   it("keeps the prior safe state when persisting a mode or stop change fails", async () => {
@@ -196,7 +219,7 @@ describe("modes and the global stop", () => {
     await mkdir(path);
 
     await expect(control.setMode("agent-x", "auto")).rejects.toThrow();
-    expect(control.mode("agent-x")).toBe("off");
+    expect(control.mode("agent-x")).toBe("ask");
     await expect(control.setStopped(false)).rejects.toThrow();
     expect(control.stopped()).toBe(true);
   });

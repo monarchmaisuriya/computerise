@@ -1,7 +1,7 @@
 {
   "name": "computerise",
   "private": true,
-  "version": "0.4.1",
+  "version": "0.5.0",
   "files": [
     "paseo-plugin.json",
     "OVERVIEW.md",
@@ -11,7 +11,8 @@
     "client/",
     "server/",
     "shared/",
-    "!**/*.test.ts"
+    "!**/*.test.ts",
+    "!server/test-*.ts"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.client.json && tsc --noEmit -p tsconfig.server.json",
@@ -33,5 +34,5 @@
     "@modelcontextprotocol/sdk": "^1.32.2",
     "zod": "^4.4.3"
   },
-  "description": "Desktop computer use for any Paseo agent: screenshots, clicks, and typing on the Mac, off until the user turns it on per agent, with approvals, a lease, a blocklist, and a stop switch."
+  "description": "Desktop computer use for any Paseo agent: screenshots, clicks, and typing on the Mac, asking before each input action unless the user changes an agent's mode, with approvals, a lease, a blocklist, and a stop switch."
 }

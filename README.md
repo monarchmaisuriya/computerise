@@ -4,7 +4,7 @@
 
 Computer use for any Paseo agent on macOS. Computerise gives Claude, Codex, OpenCode, and other MCP-capable agents tools to see and control the Mac running the Paseo daemon.
 
-Current release: **v0.5.0**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
+Current release: **v0.5.1**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
 
 ## What it provides
 
@@ -22,7 +22,7 @@ Current release: **v0.5.0**. Computerise follows [Semantic Versioning](https://s
 - Per-agent `off`, `ask`, and `auto` modes
 - Allow and Deny cards in agent chats, plus "Allow <app> this turn" for pointer actions
 - A one-agent-at-a-time screen lease
-- Mandatory built-in blocks for Paseo, terminals, code-running apps, System Settings, and password managers
+- Mandatory built-in blocks for Paseo, terminals, code-running apps, System Settings, and password managers, which also cover the apps inside their bundles
 - Global Stop and Resume controls
 - Accessibility, Screen Recording, and engine health in the Computer panel, with buttons to open the matching System Settings pane, ask macOS for the Accessibility prompt, and check Screen Recording
 - Audit logging that records typed character counts, never typed text
@@ -55,7 +55,7 @@ New agents start in ask mode, so they can take screenshots and accessibility sna
 
 Ask mode helps prevent mistakes and prompt-injected actions, but it is not a security boundary against an already-hostile agent with arbitrary local command access. See [OVERVIEW.md](OVERVIEW.md) for the complete safety and data notes.
 
-Screenshots capture the full main display by default. Turn on **Show agents only the front app** in the plugin settings to send only the front app's windows, at their real positions, with the rest of the screen black. Computerise refuses capture when a password manager is frontmost.
+Screenshots capture the full main display by default. Turn on **Show agents only the front app** in the plugin settings to send only the front app's windows, at their real positions, with the rest of the screen black. Computerise refuses capture when a password manager is frontmost, and paints the windows of password managers and apps hidden in the settings black in full-display screenshots and zooms. An app inside a blocked app's bundle, such as the Passwords menu-bar helper, is hidden and blocked the same way as that app.
 
 ## Development
 

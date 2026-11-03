@@ -239,11 +239,13 @@ export function contributeComputer(server: PluginServerContext, options: Compute
   const effectiveModes = (seats: Seats, control: ControlStore) => Object.fromEntries(seats.agents().map((agentId) => [agentId, control.mode(agentId)]));
 
   // The plugin asks the user itself in ask mode, so the CLI's own prompt for these tools would ask
-  // twice. Claude names the tool mcp__<server>__<tool>; Codex names only the server.
+  // twice. Claude names the tool mcp__<server>__<tool>; Codex names only the server. Claude names
+  // are matched in full: a server called paseo-computerise__x shares the prefix.
+  const claudeToolNames = new Set<string>(TOOL_NAMES.map((tool) => `mcp__${SERVER_NAME}__${tool}`));
   server.on("agent.permission_requested", async ({ agent, request }, { paseo: api }) => {
     remember(api);
     if (!runtime) return;
-    const ours = request.name.startsWith(`mcp__${SERVER_NAME}__`) || (request.name === "CodexMcpElicitation" && request.metadata?.serverName === SERVER_NAME);
+    const ours = claudeToolNames.has(request.name) || (request.name === "CodexMcpElicitation" && request.metadata?.serverName === SERVER_NAME);
     if (!ours) return;
     await api.agents.ref(agent.id).respondToPermission({ requestId: request.id, response: { behavior: "allow" } });
   });

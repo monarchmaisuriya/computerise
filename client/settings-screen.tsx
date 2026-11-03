@@ -57,7 +57,7 @@ export function ComputerSettingsScreen({ theme }: PluginSurfaceProps) {
           />
         </SettingsCard>
       </SettingsSection>
-      <SettingsSection title="Blocked apps" info="Paseo, terminals, code-running apps, System Settings, and password managers are always blocked. Password managers are hidden from screenshots as well as input.">
+      <SettingsSection title="Blocked apps" info="Paseo, terminals, code-running apps, System Settings, and password managers are always blocked. Password managers are hidden from screenshots as well as input. An app inside a blocked app's bundle, such as its menu-bar helper, is blocked the same way, including for the apps listed here.">
         <SettingsCard>
           <SettingsInput label="Extra apps with input blocked" hint="Bundle IDs separated by commas or new lines." initialValue={settings.values.extraNoInput.join("\n")} disabled={settings.saving} onChangeText={setNoInput} />
           <SettingsInput label="Extra apps hidden and blocked" hint="Bundle IDs separated by commas or new lines." initialValue={settings.values.extraNoView.join("\n")} disabled={settings.saving} onChangeText={setNoView} />

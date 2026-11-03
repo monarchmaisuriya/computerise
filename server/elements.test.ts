@@ -4,7 +4,7 @@ import type { UiSnapshot } from "./engine";
 
 type Element = UiSnapshot["elements"][number];
 
-const TEXTEDIT = { bundleId: "com.apple.TextEdit", name: "TextEdit" };
+const TEXTEDIT = { bundleId: "com.apple.TextEdit", name: "TextEdit", within: [] };
 const SAVE = { role: "AXButton", label: "Save", value: null, frame: [100, 200, 80, 30] as [number, number, number, number] };
 const FIELD = { role: "AXTextField", label: "Name", value: "ab", frame: [10, 20, 300, 24] as [number, number, number, number] };
 const NO_FRAME: Element = { ...SAVE, frame: null };
@@ -90,7 +90,7 @@ describe("element tables", () => {
 
 describe("describing what an action changed", () => {
   const before = { pid: 42, elements: [FIELD, SAVE] };
-  const after = (elements: Element[], pid = 42, name = "TextEdit") => ({ pid, app: { bundleId: null, name }, elements, cut: false });
+  const after = (elements: Element[], pid = 42, name = "TextEdit") => ({ pid, app: { bundleId: null, name, within: [] }, elements, cut: false });
 
   it("says nothing changed when the controls are the same", () => {
     expect(describeChange(before, after([FIELD, SAVE]))).toBe(

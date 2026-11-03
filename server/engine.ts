@@ -40,6 +40,7 @@ export type Point = { x: number; y: number };
 export type MouseButton = "left" | "right" | "middle";
 export type ScrollDirection = "up" | "down" | "left" | "right";
 export type Region = readonly [x0: number, y0: number, x1: number, y1: number];
+export type Rect = { x: number; y: number; width: number; height: number };
 export type Capture = { jpeg: Buffer; width: number; height: number };
 
 const pointSchema = z.object({ x: z.number(), y: z.number() });
@@ -47,14 +48,15 @@ const displaySchema = z.object({ width: z.number().positive(), height: z.number(
 const statusSchema = z.object({
   trusted: z.boolean(),
   cursor: pointSchema,
-  front: z.object({ name: z.string(), bundleId: z.string().nullable(), pid: z.number().int() }).nullable(),
+  front: z.object({ name: z.string(), bundleId: z.string().nullable(), within: z.array(z.string()), pid: z.number().int() }).nullable(),
   display: displaySchema,
 });
-const windowOwnerSchema = z.object({ pid: z.number().int(), name: z.string(), bundleId: z.string().nullable(), layer: z.number() }).nullable();
+const windowOwnerSchema = z.object({ pid: z.number().int(), name: z.string(), bundleId: z.string().nullable(), within: z.array(z.string()), layer: z.number() }).nullable();
 const postedSchema = z.object({ posted: z.literal(true) });
 const activateSchema = z.object({ running: z.boolean(), activated: z.boolean() });
-const appSchema = z.object({ bundleId: z.string(), path: z.string() }).nullable();
+const appSchema = z.object({ bundleId: z.string(), path: z.string(), within: z.array(z.string()) }).nullable();
 const windowsSchema = z.array(z.object({ id: z.number().int().positive(), x: z.number(), y: z.number(), width: z.number().positive(), height: z.number().positive() }));
+const screenWindowsSchema = z.array(z.object({ id: z.number().int().positive(), bundleId: z.string().nullable(), within: z.array(z.string()), x: z.number(), y: z.number(), width: z.number().positive(), height: z.number().positive() }));
 const writtenSchema = z.object({ written: z.literal(true) });
 const trustedSchema = z.object({ trusted: z.boolean() });
 
@@ -80,6 +82,7 @@ export type ScreenStatus = z.infer<typeof statusSchema>;
 export type Display = z.infer<typeof displaySchema>;
 export type WindowOwner = NonNullable<z.infer<typeof windowOwnerSchema>>;
 export type AppInfo = NonNullable<z.infer<typeof appSchema>>;
+export type ScreenWindow = z.infer<typeof screenWindowsSchema>[number];
 export type UiSnapshot = z.infer<typeof snapshotSchema>;
 
 const BUTTON_NUMBER: Record<MouseButton, number> = { left: 0, right: 1, middle: 2 };
@@ -274,29 +277,39 @@ export class MacEngine {
     return this.script("uiSnapshot", { pid, max: maxElements, budgetMs: SNAPSHOT_BUDGET_MS }, snapshotSchema, SCRIPT_TIMEOUT_MS + SNAPSHOT_BUDGET_MS);
   }
 
+  // Every on-screen window with its app, so the caller can choose which to black out of a capture.
+  onScreenWindows(): Promise<ScreenWindow[]> {
+    return this.script("onScreenWindows", {}, screenWindowsSchema);
+  }
+
   // Sent at point size, so a coordinate read off the image is the coordinate to click. With a process
-  // id, only that process's windows are shown and the rest of the display is black.
-  async screenshot(onlyPid: number | null = null): Promise<Capture> {
+  // id, only that process's windows are shown and the rest of the display is black. Each rectangle
+  // in hide (points) is painted black.
+  async screenshot(onlyPid: number | null = null, hide: readonly Rect[] = []): Promise<Capture> {
     const { display } = await this.status();
-    const jpeg = onlyPid === null ? await this.capture(["-m"], display.width) : await this.composeWindows(onlyPid, [0, 0, display.width, display.height], 1);
+    const region: Region = [0, 0, display.width, display.height];
+    const jpeg =
+      onlyPid !== null ? await this.composeWindows(onlyPid, region, 1, hide) : hide.length > 0 ? await this.captureHiding(["-m"], region, 1, hide) : await this.capture(["-m"], display.width);
     return { jpeg, width: display.width, height: display.height };
   }
 
-  async zoom(region: Region, onlyPid: number | null = null): Promise<Capture> {
+  async zoom(region: Region, onlyPid: number | null = null, hide: readonly Rect[] = []): Promise<Capture> {
     const [x0, y0, x1, y1] = region;
     if (!region.every(Number.isInteger)) throw new Error(`Expected whole-point region coordinates, got [${region.join(", ")}]`);
     if (x0 >= x1 || y0 >= y1) throw new Error(`Expected a region [x0, y0, x1, y1] with x0 < x1 and y0 < y1, got [${region.join(", ")}]`);
     const { display } = await this.status();
     requireOnDisplay({ x: x0, y: y0 }, display, "region start");
     requireOnDisplay({ x: x1 - 1, y: y1 - 1 }, display, "region end");
-    const jpeg = onlyPid === null ? await this.capture(["-R", `${x0},${y0},${x1 - x0},${y1 - y0}`], null) : await this.composeWindows(onlyPid, region, display.scale);
+    const area = ["-R", `${x0},${y0},${x1 - x0},${y1 - y0}`];
+    const jpeg =
+      onlyPid !== null ? await this.composeWindows(onlyPid, region, display.scale, hide) : hide.length > 0 ? await this.captureHiding(area, region, display.scale, hide) : await this.capture(area, null);
     return { jpeg, width: (x1 - x0) * display.scale, height: (y1 - y0) * display.scale };
   }
 
   // Never falls back to a full-display capture: that would show what the user chose to hide. Each
   // window is captured on its own with screencapture -l, which never includes other apps' windows;
   // CGWindowListCreateImage was used before and began blocking for every window (2026-10-25).
-  private async composeWindows(pid: number, region: Region, scale: number): Promise<Buffer> {
+  private async composeWindows(pid: number, region: Region, scale: number, hide: readonly Rect[]): Promise<Buffer> {
     requireIntIn("process id", pid, 1, 2 ** 31 - 1);
     const windows = await this.script("windowsOf", { pid }, windowsSchema);
     if (windows.length === 0) throw new Error("The front app has no windows on screen to show");
@@ -316,11 +329,41 @@ export class MacEngine {
         }
         layers.push({ file, x: window.x, y: window.y, width: window.width, height: window.height });
       }
-      await this.script("compose", { region, scale, out, layers }, writtenSchema, CAPTURE_TIMEOUT_MS);
+      await this.script("compose", { region, scale, out, layers, hide }, writtenSchema, CAPTURE_TIMEOUT_MS);
       this.captureAccess = "granted";
       return await readFile(out);
     } finally {
       await Promise.all([out, ...files].map((file) => rm(file, { force: true })));
+    }
+  }
+
+  // The full-pixel capture drawn over the whole region with each hide rectangle painted black, so no
+  // image without the rectangles is ever returned.
+  private async captureHiding(areaArgs: readonly string[], region: Region, scale: number, hide: readonly Rect[]): Promise<Buffer> {
+    await mkdir(this.scratchDir, { recursive: true, mode: 0o700 });
+    const raw = join(this.scratchDir, `${randomUUID()}.jpg`);
+    const out = join(this.scratchDir, `${randomUUID()}.jpg`);
+    const [x0, y0, x1, y1] = region;
+    try {
+      await this.captureFile(areaArgs, raw);
+      await this.script("compose", { region, scale, out, layers: [{ file: raw, x: x0, y: y0, width: x1 - x0, height: y1 - y0 }], hide }, writtenSchema, CAPTURE_TIMEOUT_MS);
+      return await readFile(out);
+    } finally {
+      await Promise.all([raw, out].map((file) => rm(file, { force: true })));
+    }
+  }
+
+  private async captureFile(areaArgs: readonly string[], file: string): Promise<void> {
+    try {
+      await this.run("screencapture", ["-x", ...areaArgs, "-t", "jpg", file], CAPTURE_TIMEOUT_MS);
+      this.captureAccess = "granted";
+    } catch (error) {
+      const text = failureText(error);
+      if (text.includes("could not create image")) {
+        this.captureAccess = "missing";
+        throw new Error("Paseo needs Screen Recording (System Settings > Privacy & Security > Screen Recording), then a Paseo reopen", { cause: error });
+      }
+      throw new Error(`screencapture failed: ${text}`, { cause: error });
     }
   }
 
@@ -329,17 +372,7 @@ export class MacEngine {
     const raw = join(this.scratchDir, `${randomUUID()}.jpg`);
     const scaled = join(this.scratchDir, `${randomUUID()}.jpg`);
     try {
-      try {
-        await this.run("screencapture", ["-x", ...areaArgs, "-t", "jpg", raw], CAPTURE_TIMEOUT_MS);
-        this.captureAccess = "granted";
-      } catch (error) {
-        const text = failureText(error);
-        if (text.includes("could not create image")) {
-          this.captureAccess = "missing";
-          throw new Error("Paseo needs Screen Recording (System Settings > Privacy & Security > Screen Recording), then a Paseo reopen", { cause: error });
-        }
-        throw new Error(`screencapture failed: ${text}`, { cause: error });
-      }
+      await this.captureFile(areaArgs, raw);
       if (resampleWidth === null) return await readFile(raw);
       await this.run("sips", ["--resampleWidth", String(resampleWidth), "-s", "formatOptions", "70", raw, "--out", scaled], CAPTURE_TIMEOUT_MS);
       return await readFile(scaled);

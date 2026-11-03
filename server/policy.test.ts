@@ -7,19 +7,23 @@ import { tempDir } from "./test-temp-dir";
 
 const defaults = settingsSchema.parse({});
 
+// An app identity as the engine reports it; within lists the apps whose bundles contain it.
+const app = (bundleId: string | null, within: string[] = []) => ({ bundleId, within });
+
 describe("the blocklist", () => {
   it("blocks input to Paseo, terminals, code runners, and System Settings, and viewing of password managers", () => {
-    expect(blockLevel("sh.paseo.desktop", defaults)).toBe("no-input");
-    expect(blockLevel("com.apple.Terminal", defaults)).toBe("no-input");
-    expect(blockLevel("com.apple.ScriptEditor2", defaults)).toBe("no-input");
-    expect(blockLevel("com.anthropic.claudefordesktop", defaults)).toBe("no-input");
-    expect(blockLevel("com.apple.systempreferences", defaults)).toBe("no-input");
-    expect(blockLevel("com.1password.1password", defaults)).toBe("no-view");
-    expect(blockLevel("com.apple.TextEdit", defaults)).toBe("none");
+    expect(blockLevel(app("sh.paseo.desktop"), defaults)).toBe("no-input");
+    expect(blockLevel(app("com.apple.Terminal"), defaults)).toBe("no-input");
+    expect(blockLevel(app("com.apple.ScriptEditor2"), defaults)).toBe("no-input");
+    expect(blockLevel(app("com.anthropic.claudefordesktop"), defaults)).toBe("no-input");
+    expect(blockLevel(app("com.apple.systempreferences"), defaults)).toBe("no-input");
+    expect(blockLevel(app("com.1password.1password"), defaults)).toBe("no-view");
+    expect(blockLevel(app("com.apple.Passwords"), defaults)).toBe("no-view");
+    expect(blockLevel(app("com.apple.TextEdit"), defaults)).toBe("none");
   });
 
   it("treats an app it cannot identify as blocked for input", () => {
-    expect(blockLevel(null, defaults)).toBe("no-input");
+    expect(blockLevel(app(null), defaults)).toBe("no-input");
   });
 
   it("lets the user add apps but never switch built-in safety blocks off", () => {
@@ -27,15 +31,28 @@ describe("the blocklist", () => {
       extraNoInput: ["com.apple.Notes"],
       extraNoView: ["com.apple.mail"],
     });
-    expect(blockLevel("com.apple.Notes", settings)).toBe("no-input");
-    expect(blockLevel("com.apple.mail", settings)).toBe("no-view");
-    expect(blockLevel("com.apple.Terminal", settings)).toBe("no-input");
-    expect(blockLevel("sh.paseo.desktop", settings)).toBe("no-input");
+    expect(blockLevel(app("com.apple.Notes"), settings)).toBe("no-input");
+    expect(blockLevel(app("com.apple.mail"), settings)).toBe("no-view");
+    expect(blockLevel(app("com.apple.Terminal"), settings)).toBe("no-input");
+    expect(blockLevel(app("sh.paseo.desktop"), settings)).toBe("no-input");
+  });
+
+  it("blocks an app inside a blocked app's bundle at least as strictly as the app that contains it", () => {
+    const settings = settingsSchema.parse({ extraNoView: ["com.example.vault"] });
+    expect(blockLevel(app("com.apple.Passwords.MenuBarExtra", ["com.apple.Passwords"]), defaults)).toBe("no-view");
+    expect(blockLevel(app("com.example.vault.helper", ["com.example.vault"]), settings)).toBe("no-view");
+    expect(blockLevel(app("com.apple.dt.Instruments", ["com.apple.dt.Xcode"]), defaults)).toBe("no-input");
+    expect(blockLevel(app("com.apple.TextEdit", ["com.example.outer"]), defaults)).toBe("none");
+  });
+
+  it("keeps an app's own level when it is stricter than the app that contains it", () => {
+    expect(blockLevel(app("com.1password.1password", ["com.apple.dt.Xcode"]), defaults)).toBe("no-view");
+    expect(blockLevel(app(null, ["com.example.outer"]), defaults)).toBe("no-input");
   });
 
   it("matches bundle ids exactly, not by prefix or case", () => {
-    expect(blockLevel("com.apple.Terminal.helper", defaults)).toBe("none");
-    expect(blockLevel("com.apple.terminal", defaults)).toBe("none");
+    expect(blockLevel(app("com.apple.Terminal.helper"), defaults)).toBe("none");
+    expect(blockLevel(app("com.apple.terminal"), defaults)).toBe("none");
   });
 });
 
@@ -101,8 +118,8 @@ describe("the lease", () => {
   it("keeps the working app with the holder and drops it with the lease", () => {
     const lease = new Lease(120_000, () => 0);
     lease.take("agent-x");
-    lease.setWorkingApp("agent-x", { bundleId: "com.apple.TextEdit", name: "TextEdit" });
-    expect(lease.workingApp("agent-x")).toEqual({ bundleId: "com.apple.TextEdit", name: "TextEdit" });
+    lease.setWorkingApp("agent-x", { bundleId: "com.apple.TextEdit", name: "TextEdit", within: [] });
+    expect(lease.workingApp("agent-x")).toEqual({ bundleId: "com.apple.TextEdit", name: "TextEdit", within: [] });
     expect(lease.workingApp("agent-y")).toBeNull();
     lease.release("agent-x");
     lease.take("agent-x");

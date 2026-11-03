@@ -18,6 +18,7 @@ export const BUILT_IN_BLOCKS: readonly BuiltInBlock[] = [
   { bundleId: "com.anthropic.claudefordesktop", name: "Claude", level: "no-input" },
   { bundleId: "com.apple.systempreferences", name: "System Settings", level: "no-input" },
   { bundleId: "com.apple.keychainaccess", name: "Keychain Access", level: "no-view" },
+  { bundleId: "com.apple.Passwords", name: "Passwords", level: "no-view" },
   { bundleId: "com.1password.1password", name: "1Password", level: "no-view" },
   { bundleId: "com.bitwarden.desktop", name: "Bitwarden", level: "no-view" },
 ];

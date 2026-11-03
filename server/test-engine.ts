@@ -1,12 +1,14 @@
-import type { UiSnapshot, WindowOwner } from "./engine";
+import type { ScreenWindow, UiSnapshot, WindowOwner } from "./engine";
 import type { Engine } from "./mcp";
 
-export const TEXTEDIT = { name: "TextEdit", bundleId: "com.apple.TextEdit", pid: 42 };
-export const NOTES = { name: "Notes", bundleId: "com.apple.Notes", pid: 43 };
-export const PASEO = { name: "Paseo", bundleId: "sh.paseo.desktop", pid: 44 };
-export const ONE_PASSWORD = { name: "1Password", bundleId: "com.1password.1password", pid: 45 };
+export const TEXTEDIT = { name: "TextEdit", bundleId: "com.apple.TextEdit", pid: 42, within: [] as string[] };
+export const NOTES = { name: "Notes", bundleId: "com.apple.Notes", pid: 43, within: [] as string[] };
+export const PASEO = { name: "Paseo", bundleId: "sh.paseo.desktop", pid: 44, within: [] as string[] };
+export const ONE_PASSWORD = { name: "1Password", bundleId: "com.1password.1password", pid: 45, within: [] as string[] };
+// Passwords' menu-bar helper, a separate app inside the Passwords bundle.
+export const PASSWORDS_HELPER = { name: "PasswordsMenuBarExtra", bundleId: "com.apple.Passwords.MenuBarExtra", pid: 46, within: ["com.apple.Passwords"] };
 
-export function owner(app: { name: string; bundleId: string; pid: number }): WindowOwner {
+export function owner(app: { name: string; bundleId: string; pid: number; within: string[] }): WindowOwner {
   return { ...app, layer: 0 };
 }
 
@@ -16,12 +18,13 @@ export function fakeEngine() {
   const screen = {
     trusted: true,
     cursor: { x: 500, y: 500 },
-    front: TEXTEDIT as { name: string; bundleId: string | null; pid: number } | null,
+    front: TEXTEDIT as { name: string; bundleId: string | null; pid: number; within: string[] } | null,
     under: owner(TEXTEDIT) as WindowOwner | null,
     activateBringsForward: true,
     screenRecording: "unknown" as "unknown" | "granted" | "missing",
     statusError: null as string | null,
     elements: [{ role: "AXTextArea", label: null, value: "hello", frame: [10, 20, 300, 400] }] as UiSnapshot["elements"],
+    windows: [] as ScreenWindow[],
   };
   const calls: { method: string; args: unknown[] }[] = [];
   const record = (method: string) => async (...args: unknown[]) => void calls.push({ method, args });
@@ -43,8 +46,8 @@ export function fakeEngine() {
     },
     resolveApp: async (name) => {
       calls.push({ method: "resolveApp", args: [name] });
-      const app = [TEXTEDIT, NOTES, PASEO].find((candidate) => candidate.name === name);
-      return app ? { bundleId: app.bundleId, path: `/Applications/${name}.app` } : null;
+      const app = [TEXTEDIT, NOTES, PASEO, PASSWORDS_HELPER].find((candidate) => candidate.name === name);
+      return app ? { bundleId: app.bundleId, path: `/Applications/${name}.app`, within: app.within } : null;
     },
     click: record("click"),
     move: record("move"),
@@ -53,12 +56,16 @@ export function fakeEngine() {
     type: record("type"),
     key: record("key"),
     openApp: record("openApp"),
-    screenshot: async (onlyPid = null) => {
-      calls.push({ method: "screenshot", args: [onlyPid] });
+    onScreenWindows: async () => {
+      calls.push({ method: "onScreenWindows", args: [] });
+      return screen.windows;
+    },
+    screenshot: async (onlyPid = null, hide = []) => {
+      calls.push({ method: "screenshot", args: [onlyPid, hide] });
       return { jpeg: Buffer.from("jpeg"), width: 1512, height: 982 };
     },
-    zoom: async (region, onlyPid = null) => {
-      calls.push({ method: "zoom", args: [region, onlyPid] });
+    zoom: async (region, onlyPid = null, hide = []) => {
+      calls.push({ method: "zoom", args: [region, onlyPid, hide] });
       return { jpeg: Buffer.from("zoomed"), width: 200, height: 200 };
     },
     screenRecording: () => screen.screenRecording,
@@ -79,5 +86,5 @@ export function fakeEngine() {
       return { elements: screen.elements, cut: false };
     },
   };
-  return { engine, screen, calls, effects: () => calls.filter((call) => !["status", "windowAt", "resolveApp", "interrupt"].includes(call.method)) };
+  return { engine, screen, calls, effects: () => calls.filter((call) => !["status", "windowAt", "resolveApp", "interrupt", "onScreenWindows"].includes(call.method)) };
 }

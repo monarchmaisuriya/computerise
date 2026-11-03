@@ -30,6 +30,10 @@ function fakeMac(
     trusted?: boolean;
     cursorAfter?: (input: Record<string, unknown>) => { x: number; y: number };
     windows?: (typeof TEXTEDIT_WINDOW)[];
+    screenWindows?: unknown;
+    front?: unknown;
+    under?: unknown;
+    app?: unknown;
     windowCaptureDenied?: boolean;
   } = {},
 ) {
@@ -49,7 +53,11 @@ function fakeMac(
     const input = JSON.parse(args[4]);
     switch (scriptName(args)) {
       case "status":
-        return JSON.stringify({ trusted: options.trusted ?? true, cursor: { x: 5, y: 5 }, front: { name: "TextEdit", bundleId: "com.apple.TextEdit", pid: 42 }, display: DISPLAY });
+        return JSON.stringify({ trusted: options.trusted ?? true, cursor: { x: 5, y: 5 }, front: options.front ?? { name: "TextEdit", bundleId: "com.apple.TextEdit", pid: 42, within: [] }, display: DISPLAY });
+      case "windowAt":
+        return JSON.stringify(options.under ?? null);
+      case "resolveApp":
+        return JSON.stringify(options.app ?? null);
       case "pointer": {
         const end = input.action === "drag" ? input.to : { x: input.x, y: input.y };
         return JSON.stringify(options.cursorAfter ? options.cursorAfter(input) : end);
@@ -58,6 +66,8 @@ function fakeMac(
         return JSON.stringify({ posted: true });
       case "windowsOf":
         return JSON.stringify(options.windows ?? [TEXTEDIT_WINDOW]);
+      case "onScreenWindows":
+        return JSON.stringify(options.screenWindows ?? [{ ...TEXTEDIT_WINDOW, bundleId: "com.apple.TextEdit", within: [] }]);
       case "compose":
         await writeFile(input.out, "composed-jpeg");
         return JSON.stringify({ written: true });
@@ -105,6 +115,30 @@ describe("passing model text to macOS", () => {
     await expect(engine.openApp("x; rm -rf ~")).rejects.toThrow('Expected a bundle id like com.apple.TextEdit, got "x; rm -rf ~"');
     await expect(engine.openApp("-a")).rejects.toThrow('Expected a bundle id like com.apple.TextEdit, got "-a"');
     expect(mac.calls).toHaveLength(1);
+  });
+});
+
+describe("identifying apps", () => {
+  const helper = { name: "PasswordsMenuBarExtra", bundleId: "com.apple.Passwords.MenuBarExtra", pid: 46, within: ["com.apple.Passwords"] };
+  const window = { ...TEXTEDIT_WINDOW, bundleId: helper.bundleId, within: helper.within };
+  const app = { bundleId: helper.bundleId, path: "/System/Applications/Passwords.app/Contents/Library/LoginItems/PasswordsMenuBarExtra.app", within: helper.within };
+
+  it("reports the apps whose bundles contain the front app, the window under a point, each on-screen window, and an app opened by name", async () => {
+    const engine = engineOn(fakeMac({ front: helper, under: { ...helper, layer: 0 }, screenWindows: [window], app }));
+    expect((await engine.status()).front).toEqual(helper);
+    expect(await engine.windowAt({ x: 10, y: 20 })).toEqual({ ...helper, layer: 0 });
+    expect(await engine.onScreenWindows()).toEqual([window]);
+    expect(await engine.resolveApp("PasswordsMenuBarExtra")).toEqual(app);
+  });
+
+  it("refuses an app's identity that does not say which apps contain it", async () => {
+    const { within: _front, ...bareFront } = helper;
+    const { within: _window, ...bareWindow } = window;
+    const { within: _app, ...bareApp } = app;
+    await expect(engineOn(fakeMac({ front: bareFront })).status()).rejects.toThrow("The status script returned an unexpected shape");
+    await expect(engineOn(fakeMac({ under: { ...bareFront, layer: 0 } })).windowAt({ x: 10, y: 20 })).rejects.toThrow("The windowAt script returned an unexpected shape");
+    await expect(engineOn(fakeMac({ screenWindows: [bareWindow] })).onScreenWindows()).rejects.toThrow("The onScreenWindows script returned an unexpected shape");
+    await expect(engineOn(fakeMac({ app: bareApp })).resolveApp("PasswordsMenuBarExtra")).rejects.toThrow("The resolveApp script returned an unexpected shape");
   });
 });
 
@@ -215,7 +249,7 @@ describe("capturing the screen", () => {
     expect(captures.map((call) => call.args.slice(0, -1))).toEqual([["-x", "-o", "-l", "7", "-t", "png"]]);
     const windowFile = captures[0].args.at(-1) as string;
     const composed = mac.calls.filter((call) => call.file === "osascript" && scriptName(call.args) === "compose").map(scriptInput);
-    expect(composed).toEqual([{ region: [0, 0, 1512, 982], scale: 1, out: expect.any(String), layers: [{ file: windowFile, x: 316, y: 159, width: 880, height: 448 }] }]);
+    expect(composed).toEqual([{ region: [0, 0, 1512, 982], scale: 1, out: expect.any(String), layers: [{ file: windowFile, x: 316, y: 159, width: 880, height: 448 }], hide: [] }]);
     expect(existsSync(composed[0].out as string)).toBe(false);
     expect(existsSync(windowFile)).toBe(false);
     expect(mac.calls.some((call) => call.file === "sips")).toBe(false);
@@ -223,6 +257,38 @@ describe("capturing the screen", () => {
     const zoomed = await engine.zoom([100, 100, 300, 200], 42);
     expect(zoomed).toEqual({ jpeg: Buffer.from("composed-jpeg"), width: 400, height: 200 });
     expect(scriptInput(mac.calls.filter((call) => call.file === "osascript" && scriptName(call.args) === "compose")[1])).toMatchObject({ region: [100, 100, 300, 200], scale: 2 });
+  });
+
+  it("lists every on-screen window with its app, and refuses a list of another shape", async () => {
+    const window = { id: 9, bundleId: "com.1password.1password", within: [], x: 10, y: 20, width: 300, height: 200 };
+    expect(await engineOn(fakeMac({ screenWindows: [window, { ...window, id: 10, bundleId: null }] })).onScreenWindows()).toEqual([window, { ...window, id: 10, bundleId: null }]);
+    await expect(engineOn(fakeMac({ screenWindows: [{ id: 9 }] })).onScreenWindows()).rejects.toThrow("The onScreenWindows script returned an unexpected shape");
+  });
+
+  it("paints the given rectangles black over a display capture at point size, without sips, then deletes the files", async () => {
+    const mac = fakeMac();
+    const hide = [{ x: 10, y: 20, width: 300, height: 200 }];
+    const shot = await engineOn(mac).screenshot(null, hide);
+    expect(shot).toEqual({ jpeg: Buffer.from("composed-jpeg"), width: 1512, height: 982 });
+    const capture = mac.calls.find((call) => call.file === "screencapture")!;
+    const raw = capture.args.at(-1) as string;
+    expect(capture.args).toEqual(["-x", "-m", "-t", "jpg", raw]);
+    const composed = mac.calls.filter((call) => call.file === "osascript" && scriptName(call.args) === "compose").map(scriptInput);
+    expect(composed).toEqual([{ region: [0, 0, 1512, 982], scale: 1, out: expect.any(String), layers: [{ file: raw, x: 0, y: 0, width: 1512, height: 982 }], hide }]);
+    expect(mac.calls.some((call) => call.file === "sips")).toBe(false);
+    expect(existsSync(raw)).toBe(false);
+    expect(existsSync(composed[0].out as string)).toBe(false);
+  });
+
+  it("paints the given rectangles black over a zoomed region at full pixel resolution", async () => {
+    const mac = fakeMac();
+    const hide = [{ x: 10, y: 20, width: 300, height: 200 }];
+    const shot = await engineOn(mac).zoom([100, 100, 300, 200], null, hide);
+    expect(shot).toEqual({ jpeg: Buffer.from("composed-jpeg"), width: 400, height: 200 });
+    const capture = mac.calls.find((call) => call.file === "screencapture")!;
+    expect(capture.args.slice(0, 3)).toEqual(["-x", "-R", "100,100,200,100"]);
+    const composed = mac.calls.filter((call) => call.file === "osascript" && scriptName(call.args) === "compose").map(scriptInput);
+    expect(composed).toEqual([{ region: [100, 100, 300, 200], scale: 2, out: expect.any(String), layers: [{ file: capture.args.at(-1), x: 100, y: 100, width: 200, height: 100 }], hide }]);
   });
 
   it("never falls back to the full display when one app's windows cannot be captured", async () => {

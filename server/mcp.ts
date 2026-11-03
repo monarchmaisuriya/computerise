@@ -6,7 +6,7 @@ import type { Mode, Settings } from "../shared/contracts";
 import { type Approvals, type ApprovalScopes, singleApp } from "./approvals";
 import type { AuditLog } from "./audit";
 import { center, describeChange, describeElement, type ElementTables, type ExpectedElement, matchLive, pickElement } from "./elements";
-import { LIMITS, type MacEngine, type MouseButton, type Point, type ScreenStatus, type ScrollDirection, type UiSnapshot } from "./engine";
+import { type Capture, LIMITS, type MacEngine, type MouseButton, type Point, type Rect, type ScreenStatus, type ScrollDirection, type UiSnapshot } from "./engine";
 import { type AppRef, blockLevel, type ControlStore, type Failsafe, type Lease, LeaseHeldError, type RateLimiter } from "./policy";
 import type { Seats } from "./seats";
 import type { TokenAuthority } from "./tokens";
@@ -37,7 +37,7 @@ function auditFailed(error: unknown): void {
 
 export type Engine = Pick<
   MacEngine,
-  "status" | "windowAt" | "activate" | "resolveApp" | "openApp" | "click" | "move" | "drag" | "scroll" | "type" | "key" | "screenshot" | "zoom" | "uiSnapshot" | "screenRecording" | "interrupt" | "openPrivacySettings" | "promptAccessibility" | "checkScreenRecording"
+  "status" | "windowAt" | "activate" | "resolveApp" | "openApp" | "click" | "move" | "drag" | "scroll" | "type" | "key" | "screenshot" | "zoom" | "onScreenWindows" | "uiSnapshot" | "screenRecording" | "interrupt" | "openPrivacySettings" | "promptAccessibility" | "checkScreenRecording"
 >;
 
 export interface ComputerMcpOptions {
@@ -179,18 +179,36 @@ export class ComputerMcp {
       kind: "read",
       run: async (agentId, _args, status, settings) => {
         const pid = capturedPid(status, settings);
-        const shot = await options.engine.screenshot(pid);
+        const { shot, note } = await this.hidingCapture(settings, (hide) => options.engine.screenshot(pid, hide));
         const front = status.front ? appLabel(status.front) : "none";
         const scope = pid === null ? "" : "; only the front app's windows are shown, the rest is black";
         return {
           content: [
             { type: "image", data: shot.jpeg.toString("base64"), mimeType: "image/jpeg" },
-            { type: "text", text: `Main display, ${shot.width} x ${shot.height} points; front app: ${front}; pointer at ${at(status.cursor)}${scope}` },
+            { type: "text", text: `Main display, ${shot.width} x ${shot.height} points; front app: ${front}; pointer at ${at(status.cursor)}${scope}${note}` },
           ],
           accepted: () => options.panel?.screenshot(agentId, shot.jpeg, shot.width, shot.height),
         };
       },
     };
+  }
+
+  // A full-display capture shows every app, so the windows of apps blocked from view are blacked
+  // out. The front-app scope shows only the front app, which read() refuses when it is blocked.
+  private async hiddenWindows(settings: Settings): Promise<Rect[]> {
+    if (settings.screenshotScope !== "display") return [];
+    const windows = await this.options.engine.onScreenWindows();
+    return windows.filter((window) => blockLevel(window, settings) === "no-view").map(({ x, y, width, height }) => ({ x, y, width, height }));
+  }
+
+  // The hidden windows are listed again after the capture: one that appeared or moved meanwhile may
+  // be in the image unmasked, so the image is refused rather than returned.
+  private async hidingCapture(settings: Settings, capture: (hide: Rect[]) => Promise<Capture>): Promise<{ shot: Capture; note: string }> {
+    const hide = await this.hiddenWindows(settings);
+    const shot = await capture(hide);
+    const key = (rects: Rect[]) => JSON.stringify(rects.map(({ x, y, width, height }) => [x, y, width, height]).sort());
+    if (key(await this.hiddenWindows(settings)) !== key(hide)) throw new Refusal("A hidden app's window moved or appeared while capturing; take the screenshot again");
+    return { shot, note: hide.length > 0 ? "; windows of apps hidden from view are blacked out" : "" };
   }
 
   // Reads the front window's controls through the read checks; once the read is accepted they become
@@ -204,7 +222,7 @@ export class ComputerMcp {
         const snapshot = await this.options.engine.uiSnapshot(front.pid, max);
         return {
           content: textContent(report(front, snapshot)),
-          accepted: () => this.options.elements.set(agentId, { pid: front.pid, app: { bundleId: front.bundleId, name: front.name }, max, elements: snapshot.elements }),
+          accepted: () => this.options.elements.set(agentId, { pid: front.pid, app: { bundleId: front.bundleId, name: front.name, within: front.within }, max, elements: snapshot.elements }),
         };
       },
     };
@@ -213,7 +231,7 @@ export class ComputerMcp {
   // Never reads an app blocked from view, the same rule the read path applies.
   private async controlsBefore(status: ScreenStatus, settings: Settings, max: number): Promise<Observed["before"]> {
     const front = status.front;
-    if (!front || blockLevel(front.bundleId, settings) === "no-view") return null;
+    if (!front || blockLevel(front, settings) === "no-view") return null;
     return { pid: front.pid, elements: (await this.options.engine.uiSnapshot(front.pid, max)).elements };
   }
 
@@ -245,13 +263,13 @@ export class ComputerMcp {
   }
 
   private requireInputAllowed(apps: AppRef[], settings: Settings): void {
-    for (const app of apps) if (blockLevel(app.bundleId, settings) !== "none") throw new Refusal(`${appLabel(app)} is blocked for input`);
+    for (const app of apps) if (blockLevel(app, settings) !== "none") throw new Refusal(`${appLabel(app)} is blocked for input`);
   }
 
   private async appAt(point: Point): Promise<AppRef> {
     const owner = await this.options.engine.windowAt(point);
     if (owner === null) throw new Refusal(`No window is under ${at(point)}; take a new screenshot`);
-    return { bundleId: owner.bundleId, name: owner.name };
+    return { bundleId: owner.bundleId, name: owner.name, within: owner.within };
   }
 
   // Approving in Paseo makes Paseo the front app, so the working app is brought back before acting.
@@ -271,14 +289,14 @@ export class ComputerMcp {
 
   private async read<A>(agentId: string, spec: ReadSpec<A>, args: A, status: ScreenStatus, settings: Settings, afterAction: boolean) {
     const front = status.front;
-    if (front && blockLevel(front.bundleId, settings) === "no-view") throw new Refusal(`${appLabel(front)} is blocked from view`);
+    if (front && blockLevel(front, settings) === "no-view") throw new Refusal(`${appLabel(front)} is blocked from view`);
     const result = await spec.run(agentId, args, status, settings);
     const after = await this.options.engine.status();
-    if (after.front && blockLevel(after.front.bundleId, settings) === "no-view") throw new Refusal(`${appLabel(after.front)} is blocked from view`);
+    if (after.front && blockLevel(after.front, settings) === "no-view") throw new Refusal(`${appLabel(after.front)} is blocked from view`);
     if (after.front?.pid !== front?.pid || after.front?.bundleId !== front?.bundleId) throw new Refusal("The screen changed while reading; try again");
     // Input goes where the agent chose to look or what it opened; an automatic read after an action
     // (for example while an app opened by open_app is still launching) never redirects it.
-    if (front && !afterAction) this.options.lease.setWorkingApp(agentId, { bundleId: front.bundleId, name: front.name });
+    if (front && !afterAction) this.options.lease.setWorkingApp(agentId, { bundleId: front.bundleId, name: front.name, within: front.within });
     result.accepted?.();
     return { content: result.content, target: front?.bundleId ?? null };
   }
@@ -352,7 +370,7 @@ export class ComputerMcp {
   // controls, so they are replaced by this read, or dropped if it is refused.
   private async stateAfterAction(agentId: string, { before, max }: Observed): Promise<Content[]> {
     this.options.elements.clear(agentId);
-    const spec = this.controlsSpec(max, (front, after) => describeChange(before, { pid: front.pid, app: { bundleId: front.bundleId, name: front.name }, elements: after.elements, cut: after.cut }));
+    const spec = this.controlsSpec(max, (front, after) => describeChange(before, { pid: front.pid, app: { bundleId: front.bundleId, name: front.name, within: front.within }, elements: after.elements, cut: after.cut }));
     return this.readAfterAction(agentId, "ui_snapshot", spec, "No state");
   }
 
@@ -482,7 +500,7 @@ export class ComputerMcp {
     const keyboardTarget = async (_agentId: string, _args: unknown, working: AppRef | null, planned: Target | null): Promise<Target> => {
       if (planned === null) return { apps: working ? [working] : [], point: null, element: null };
       const front = (await engine.status()).front;
-      return { apps: front ? [{ bundleId: front.bundleId, name: front.name }] : [], point: null, element: null };
+      return { apps: front ? [{ bundleId: front.bundleId, name: front.name, within: front.within }] : [], point: null, element: null };
     };
 
     register<Record<string, never>>(
@@ -525,11 +543,12 @@ export class ComputerMcp {
       {
         kind: "read",
         run: async (_agentId, { region }, status, settings) => {
-          const shot = await engine.zoom(region, capturedPid(status, settings));
+          const pid = capturedPid(status, settings);
+          const { shot, note } = await this.hidingCapture(settings, (hide) => engine.zoom(region, pid, hide));
           return {
             content: [
               { type: "image", data: shot.jpeg.toString("base64"), mimeType: "image/jpeg" },
-              { type: "text", text: `Region [${region.join(", ")}], ${shot.width} x ${shot.height} pixels` },
+              { type: "text", text: `Region [${region.join(", ")}], ${shot.width} x ${shot.height} pixels${note}` },
             ],
           };
         },
@@ -660,7 +679,7 @@ export class ComputerMcp {
       target: async (_agentId, { name }) => {
         const app = await engine.resolveApp(name);
         if (app === null) throw new Refusal(`No app named ${JSON.stringify(name)}`);
-        return { apps: [{ bundleId: app.bundleId, name }], point: null, element: null };
+        return { apps: [{ bundleId: app.bundleId, name, within: app.within }], point: null, element: null };
       },
       describe: (_args, { apps: [app] }) => `open ${appLabel(app)}`,
       act: async (_args, { apps: [app] }) => engine.openApp(app.bundleId as string),

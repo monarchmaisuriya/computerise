@@ -1,11 +1,11 @@
 import { execFile } from "node:child_process";
-import { realpath, writeFile } from "node:fs/promises";
+import { mkdir, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { center } from "./elements";
 import { MacEngine, runFile } from "./engine";
-import { SCRIPTS } from "./engine-scripts";
+import { ENCLOSING_APPS, SCRIPTS } from "./engine-scripts";
 import { ScriptHost } from "./script-host";
 import { tempDir } from "./test-temp-dir";
 
@@ -47,6 +47,26 @@ const CLOSE_SCRATCH = `function run(argv) {
   for (var i = documents.length - 1; i >= 0; i--) if (paths.indexOf(documents[i].path()) !== -1) documents[i].close({ saving: "no" });
 }`;
 
+// The red, green, and blue of one pixel of an image file, from 0 to 1; x and y from the top left.
+const PIXEL = `ObjC.import('AppKit');
+function run(argv) {
+  var a = JSON.parse(argv[0]);
+  var rep = $.NSBitmapImageRep.imageRepWithData($.NSData.dataWithContentsOfFile(a.file));
+  var c = rep.colorAtXY(a.x, a.y).colorUsingColorSpace($.NSColorSpace.deviceRGBColorSpace);
+  return JSON.stringify([c.redComponent, c.greenComponent, c.blueComponent]);
+}`;
+
+async function enclosingBundleIds(path: string): Promise<string[]> {
+  const script = `ObjC.import('AppKit');\n${ENCLOSING_APPS}\nfunction run(argv) { return JSON.stringify(enclosingBundleIds(JSON.parse(argv[0]))); }`;
+  const { stdout } = await promisify(execFile)("osascript", ["-l", "JavaScript", "-e", script, JSON.stringify(path)]);
+  return JSON.parse(stdout);
+}
+
+async function fakeBundle(path: string, bundleId: string): Promise<void> {
+  await mkdir(join(path, "Contents"), { recursive: true });
+  await writeFile(join(path, "Contents", "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>${bundleId}</string></dict></plist>\n`);
+}
+
 describe.runIf(process.env.COMPUTERISE_LIVE === "1")("the engine on this Mac", () => {
   afterAll(() => host.close());
   afterEach(async () => {
@@ -76,6 +96,33 @@ describe.runIf(process.env.COMPUTERISE_LIVE === "1")("the engine on this Mac", (
     expect(shot.jpeg.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
     expect({ width: shot.width, height: shot.height }).toEqual({ width: display.width, height: display.height });
     expect(engine.screenRecording()).toBe("granted");
+  });
+
+  it("paints a hidden window black in a full-display screenshot", async () => {
+    await openScratch("hidden-check.txt", { background: true });
+    const { display } = await engine.status();
+    const window = (await engine.onScreenWindows()).find((candidate) => candidate.bundleId === "com.apple.TextEdit" && candidate.x >= 0 && candidate.y >= 0 && candidate.x + candidate.width <= display.width && candidate.y + candidate.height <= display.height);
+    if (!window) throw new Error("No TextEdit window lies wholly on the main display");
+    const shot = await engine.screenshot(null, [window]);
+    const file = join(tempDir("computerise-live-shot-"), "shot.jpg");
+    await writeFile(file, shot.jpeg);
+    const middle = { x: Math.round(window.x + window.width / 2), y: Math.round(window.y + window.height / 2) };
+    const { stdout } = await promisify(execFile)("osascript", ["-l", "JavaScript", "-e", PIXEL, JSON.stringify({ file, ...middle })]);
+    expect(Math.max(...JSON.parse(stdout))).toBeLessThan(0.05);
+  });
+
+  it("names the Passwords app as the one containing its menu-bar helper", async () => {
+    expect(await enclosingBundleIds("/System/Applications/Passwords.app/Contents/Library/LoginItems/PasswordsMenuBarExtra.app")).toEqual(["com.apple.Passwords"]);
+  });
+
+  it("names every app bundle that contains an app, innermost first, skipping folders that are not bundles", async () => {
+    const outer = join(tempDir("computerise-live-bundle-"), "Outer.app");
+    const inner = join(outer, "Contents", "Helpers", "Inner.app");
+    await fakeBundle(outer, "com.example.outer");
+    await fakeBundle(inner, "com.example.inner");
+    await mkdir(join(inner, "Contents", "Plain.app"), { recursive: true });
+    expect(await enclosingBundleIds(join(inner, "Contents", "Plain.app", "Tool.app"))).toEqual(["com.example.inner", "com.example.outer"]);
+    expect(await enclosingBundleIds(outer)).toEqual([]);
   });
 
   it("refuses to type when the front app is not the one checked, before posting a key", async () => {

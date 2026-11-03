@@ -15,7 +15,7 @@ import { ComputerMcp, mcpServerEntry, SERVER_NAME, TOOL_NAMES } from "./mcp";
 import { PanelState } from "./panel-state";
 import { ControlStore, Failsafe, Lease, RateLimiter } from "./policy";
 import { Seats } from "./seats";
-import { fakeEngine, NOTES, ONE_PASSWORD, owner, PASEO, TEXTEDIT } from "./test-engine";
+import { fakeEngine, NOTES, ONE_PASSWORD, owner, PASEO, PASSWORDS_HELPER, TEXTEDIT } from "./test-engine";
 import { tempDir } from "./test-temp-dir";
 import { TokenAuthority } from "./tokens";
 import { PLUGIN_VERSION } from "./version";
@@ -311,12 +311,86 @@ describe("the computer MCP endpoint", () => {
     currentSettings = { ...currentSettings, screenshotScope: "front-app" };
     await call(client, "screenshot");
     await call(client, "zoom");
-    expect(mac.effects().map((effect) => [effect.method, effect.args.at(-1)])).toEqual([
-      ["screenshot", null],
-      ["zoom", null],
-      ["screenshot", 42],
-      ["zoom", 42],
+    expect(mac.effects().map((effect) => [effect.method, ...effect.args.slice(-2)])).toEqual([
+      ["screenshot", null, []],
+      ["zoom", null, []],
+      ["screenshot", 42, []],
+      ["zoom", 42, []],
     ]);
+  });
+
+  describe("blacking out apps hidden from view", () => {
+    const VAULT = { id: 9, bundleId: ONE_PASSWORD.bundleId, within: [], x: 10, y: 20, width: 300, height: 200 };
+    const RECT = { x: 10, y: 20, width: 300, height: 200 };
+
+    it("paints a password manager's window black in a full-display screenshot while another app is in front", async () => {
+      const client = await agent("agent-x", "auto");
+      mac.screen.windows = [{ id: 7, bundleId: TEXTEDIT.bundleId, within: [], x: 0, y: 0, width: 800, height: 600 }, VAULT];
+      const result = await call(client, "screenshot");
+      expect(result.isError).toBe(false);
+      expect(result.text).toContain("windows of apps hidden from view are blacked out");
+      expect(mac.effects()).toEqual([{ method: "screenshot", args: [null, [RECT]] }]);
+      expect(panel.snapshot().screenshot).not.toBeNull();
+    });
+
+    it("paints the user's extra hidden apps black in a zoom", async () => {
+      currentSettings = settingsSchema.parse({ extraNoView: [NOTES.bundleId] });
+      const client = await agent("agent-x", "auto");
+      mac.screen.windows = [{ ...VAULT, bundleId: NOTES.bundleId }];
+      const result = await call(client, "zoom");
+      expect(result.text).toContain("windows of apps hidden from view are blacked out");
+      expect(mac.effects()).toEqual([{ method: "zoom", args: [[0, 0, 100, 100], null, [RECT]] }]);
+    });
+
+    it("paints black the window of an app inside a password manager's bundle, such as its menu-bar helper", async () => {
+      const client = await agent("agent-x", "auto");
+      mac.screen.windows = [{ ...VAULT, bundleId: PASSWORDS_HELPER.bundleId, within: PASSWORDS_HELPER.within }];
+      expect((await call(client, "screenshot")).text).toContain("windows of apps hidden from view are blacked out");
+      expect(mac.effects()).toEqual([{ method: "screenshot", args: [null, [RECT]] }]);
+    });
+
+    it("captures as before when no hidden app has a window on screen", async () => {
+      const client = await agent("agent-x", "auto");
+      mac.screen.windows = [{ ...VAULT, bundleId: TEXTEDIT.bundleId }, { ...VAULT, id: 10, bundleId: null }];
+      const result = await call(client, "screenshot");
+      expect(result.text).not.toContain("blacked out");
+      expect(mac.effects()).toEqual([{ method: "screenshot", args: [null, []] }]);
+    });
+
+    it("reads no window list in the front-app scope, which shows only the front app", async () => {
+      currentSettings = { ...currentSettings, screenshotScope: "front-app" };
+      const client = await agent("agent-x", "auto");
+      mac.screen.windows = [VAULT];
+      expect((await call(client, "screenshot")).isError).toBe(false);
+      expect(mac.calls.some((effect) => effect.method === "onScreenWindows")).toBe(false);
+      expect(mac.effects()).toEqual([{ method: "screenshot", args: [42, []] }]);
+    });
+
+    it("drops the image when a hidden window appears or moves while capturing", async () => {
+      const client = await agent("agent-x", "auto");
+      const capture = mac.engine.screenshot;
+      mac.engine.screenshot = async (...args) => {
+        const shot = await capture(...args);
+        mac.screen.windows = [VAULT];
+        return shot;
+      };
+      const result = await call(client, "screenshot");
+      expect(result.isError).toBe(true);
+      expect(result.text).toContain("A hidden app's window moved or appeared while capturing");
+      expect(result.content.some((part) => part.type === "image")).toBe(false);
+      expect(panel.snapshot().screenshot).toBeNull();
+    });
+
+    it("captures nothing when the window list cannot be read", async () => {
+      const client = await agent("agent-x", "auto");
+      mac.engine.onScreenWindows = async () => {
+        throw new Error("The onScreenWindows script failed: no window server");
+      };
+      const result = await call(client, "screenshot");
+      expect(result.isError).toBe(true);
+      expect(result.text).toContain("no window server");
+      expect(mac.effects()).toEqual([]);
+    });
   });
 
   it("rate-limits read tools as well as actions", async () => {
@@ -357,6 +431,18 @@ describe("the computer MCP endpoint", () => {
     const shot = await call(client, "screenshot");
     expect(shot.isError).toBe(true);
     expect(shot.text).toContain("1Password (com.1password.1password) is blocked from view");
+    expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot"]);
+  });
+
+  it("blocks an app inside a blocked app's bundle like the app that contains it", async () => {
+    const client = await agent("agent-x", "auto");
+    await call(client, "screenshot");
+    expect((await call(client, "open_app", { name: PASSWORDS_HELPER.name })).text).toContain("PasswordsMenuBarExtra (com.apple.Passwords.MenuBarExtra) is blocked for input");
+    mac.screen.under = owner(PASSWORDS_HELPER);
+    expect((await call(client, "click")).text).toContain("PasswordsMenuBarExtra (com.apple.Passwords.MenuBarExtra) is blocked for input");
+    mac.screen.front = PASSWORDS_HELPER;
+    expect((await call(client, "screenshot")).text).toContain("PasswordsMenuBarExtra (com.apple.Passwords.MenuBarExtra) is blocked from view");
+    expect((await call(client, "ui_snapshot")).text).toContain("is blocked from view");
     expect(mac.effects().map((effect) => effect.method)).toEqual(["screenshot"]);
   });
 

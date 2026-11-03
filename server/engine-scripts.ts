@@ -3,16 +3,37 @@
 // Event type, button, and flag numbers are CoreGraphics constants written out, because the JXA
 // bridge does not expose every enum. Permission traps are in the plan's part 1 results.
 
+// Pasted into every script that identifies an app. within lists the bundle ids of the app bundles
+// that contain the app, innermost first, so a helper such as Passwords' menu-bar extra
+// (Passwords.app/Contents/Library/LoginItems/PasswordsMenuBarExtra.app) is blocked like Passwords.
+export const ENCLOSING_APPS = String.raw`
+function enclosingBundleIds(path) {
+  var parts = path.replace(/\/+$/, '').split('/'), ids = [];
+  for (var i = parts.length - 2; i > 0; i--) {
+    if (!/\.app$/.test(parts[i])) continue;
+    var bundle = $.NSBundle.bundleWithPath(parts.slice(0, i + 1).join('/'));
+    var id = bundle.isNil() ? null : (ObjC.unwrap(bundle.bundleIdentifier) || null);
+    if (id !== null) ids.push(id);
+  }
+  return ids;
+}
+function runningAppWithin(app) {
+  if (app.isNil() || app.bundleURL.isNil()) return [];
+  return enclosingBundleIds(ObjC.unwrap(app.bundleURL.path));
+}`;
+
 const status = String.raw`
 ObjC.import('AppKit');
 ObjC.import('CoreGraphics');
 ObjC.import('ApplicationServices');
+${ENCLOSING_APPS}
 function run() {
   var p = $.CGEventGetLocation($.CGEventCreate(null));
   var app = $.NSWorkspace.sharedWorkspace.frontmostApplication;
   var front = app.isNil() ? null : {
     name: ObjC.unwrap(app.localizedName) || '',
     bundleId: ObjC.unwrap(app.bundleIdentifier) || null,
+    within: runningAppWithin(app),
     pid: app.processIdentifier
   };
   // The display screencapture -m captures and point coordinates start on; mainScreen is the one
@@ -33,6 +54,7 @@ function run() {
 const windowAt = String.raw`
 ObjC.import('AppKit');
 ObjC.import('CoreGraphics');
+${ENCLOSING_APPS}
 function run(argv) {
   var input = JSON.parse(argv[0]);
   $.NSApplication.sharedApplication;
@@ -49,6 +71,7 @@ function run(argv) {
       pid: w.kCGWindowOwnerPID,
       name: w.kCGWindowOwnerName || '',
       bundleId: app.isNil() ? null : (ObjC.unwrap(app.bundleIdentifier) || null),
+      within: runningAppWithin(app),
       layer: w.kCGWindowLayer
     });
   }
@@ -165,13 +188,14 @@ function run(argv) {
 
 const resolveApp = String.raw`
 ObjC.import('AppKit');
+${ENCLOSING_APPS}
 function run(argv) {
   var input = JSON.parse(argv[0]);
   var path = $.NSWorkspace.sharedWorkspace.fullPathForApplication(input.name);
   if (path.isNil()) return JSON.stringify(null);
   var bundle = $.NSBundle.bundleWithPath(path);
   var bundleId = bundle.isNil() ? null : (ObjC.unwrap(bundle.bundleIdentifier) || null);
-  return JSON.stringify(bundleId === null ? null : { bundleId: bundleId, path: ObjC.unwrap(path) });
+  return JSON.stringify(bundleId === null ? null : { bundleId: bundleId, path: ObjC.unwrap(path), within: enclosingBundleIds(ObjC.unwrap(path)) });
 }`;
 
 // Reads the front window's controls through the Accessibility API directly. System Events hung for
@@ -255,9 +279,32 @@ function run(argv) {
   return JSON.stringify(mine);
 }`;
 
-// Draws already-captured window images onto a black canvas covering a region of the main display,
-// at the windows' real positions, so a coordinate read off the image is still the point to click.
-// The canvas has its origin at the bottom left, while window bounds have theirs at the top left.
+// Every on-screen window of every process, with its app's bundle id (null when unknown), the apps
+// that contain it, and its bounds in points. Owners and bounds are readable without Screen Recording.
+const onScreenWindows = String.raw`
+ObjC.import('AppKit');
+ObjC.import('CoreGraphics');
+${ENCLOSING_APPS}
+function run() {
+  var onScreenOnly = 1, excludeDesktop = 16;
+  var windows = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(onScreenOnly | excludeDesktop, 0)));
+  var apps = {}, out = [];
+  for (var i = 0; i < windows.length; i++) {
+    var w = windows[i], b = w.kCGWindowBounds, pid = w.kCGWindowOwnerPID;
+    if (b.Width < 1 || b.Height < 1) continue;
+    if (!Object.prototype.hasOwnProperty.call(apps, pid)) {
+      var app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(pid);
+      apps[pid] = { bundleId: app.isNil() ? null : (ObjC.unwrap(app.bundleIdentifier) || null), within: runningAppWithin(app) };
+    }
+    out.push({ id: w.kCGWindowNumber, bundleId: apps[pid].bundleId, within: apps[pid].within, x: b.X, y: b.Y, width: b.Width, height: b.Height });
+  }
+  return JSON.stringify(out);
+}`;
+
+// Draws already-captured images onto a black canvas covering a region of the main display, at
+// their real positions, so a coordinate read off the image is still the point to click; then
+// paints each hide rectangle black over them. The canvas has its origin at the bottom left, while
+// window bounds have theirs at the top left.
 const compose = String.raw`
 ObjC.import('AppKit');
 function run(argv) {
@@ -275,13 +322,18 @@ function run(argv) {
     if (image.isNil()) throw new Error('Could not read the captured image of a window');
     image.drawInRectFromRectOperationFraction({ origin: { x: (l.x - x0) * a.scale, y: height - (l.y - y0 + l.height) * a.scale }, size: { width: l.width * a.scale, height: l.height * a.scale } }, wholeImage, sourceOver, 1);
   }
+  $.NSColor.blackColor.setFill;
+  for (var h = 0; h < a.hide.length; h++) {
+    var r = a.hide[h];
+    $.NSRectFill({ origin: { x: (r.x - x0) * a.scale, y: height - (r.y - y0 + r.height) * a.scale }, size: { width: r.width * a.scale, height: r.height * a.scale } });
+  }
   $.NSGraphicsContext.restoreGraphicsState;
   var jpeg = 3;
   if (!rep.representationUsingTypeProperties(jpeg, $({ NSImageCompressionFactor: 0.7 })).writeToFileAtomically(a.out, true)) throw new Error('Could not write the composed screenshot');
   return JSON.stringify({ written: true });
 }`;
 
-export const SCRIPTS = { status, windowAt, pointer, keyboard, activate, resolveApp, uiSnapshot, windowsOf, compose, promptAccessibility } as const;
+export const SCRIPTS = { status, windowAt, pointer, keyboard, activate, resolveApp, uiSnapshot, windowsOf, onScreenWindows, compose, promptAccessibility } as const;
 export type ScriptName = keyof typeof SCRIPTS;
 
 // One long-lived osascript that runs the fixed programs above on request, so each call costs about

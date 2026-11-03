@@ -7,11 +7,21 @@ import { readJsonFile, writeJsonFile } from "./json-file";
 export const DEFAULT_MODE: Mode = "ask";
 
 export type BlockLevel = "none" | "no-input" | "no-view";
-export type AppRef = { bundleId: string | null; name: string };
+// within lists the bundle ids of the app bundles that contain the app, innermost first.
+export type AppRef = { bundleId: string | null; name: string; within: readonly string[] };
 export type Point = { x: number; y: number };
 
+const STRICTNESS: readonly BlockLevel[] = ["none", "no-input", "no-view"];
+
+// An app inside a blocked app's bundle, such as its menu-bar helper, is blocked at least as strictly
+// as every app that contains it.
+export function blockLevel(app: { bundleId: string | null; within: readonly string[] }, settings: Settings): BlockLevel {
+  const levels = [app.bundleId, ...app.within].map((bundleId) => ownLevel(bundleId, settings));
+  return levels.reduce((strictest, level) => (STRICTNESS.indexOf(level) > STRICTNESS.indexOf(strictest) ? level : strictest));
+}
+
 // An app without a bundle id cannot be matched against the list, so it is not acted on.
-export function blockLevel(bundleId: string | null, settings: Settings): BlockLevel {
+function ownLevel(bundleId: string | null, settings: Settings): BlockLevel {
   if (bundleId === null) return "no-input";
   if (bundleId === PASEO_BUNDLE_ID) return "no-input";
   if (settings.extraNoView.includes(bundleId)) return "no-view";

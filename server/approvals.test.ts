@@ -195,8 +195,8 @@ describe("withdrawing one agent's approvals", () => {
 describe("apps allowed for the rest of a turn", () => {
   it("covers an action only when every receiving app is allowed for that agent", () => {
     const scopes = new ApprovalScopes();
-    const textEdit = { bundleId: "com.apple.TextEdit", name: "TextEdit" };
-    const notes = { bundleId: "com.apple.Notes", name: "Notes" };
+    const textEdit = { bundleId: "com.apple.TextEdit", name: "TextEdit", within: [] };
+    const notes = { bundleId: "com.apple.Notes", name: "Notes", within: [] };
     scopes.allow("agent-x", "com.apple.TextEdit");
     expect(scopes.covers("agent-x", [textEdit])).toBe(true);
     expect(scopes.covers("agent-x", [textEdit, notes])).toBe(false);
@@ -205,7 +205,7 @@ describe("apps allowed for the rest of a turn", () => {
     expect(scopes.covers("agent-x", [notes, notes])).toBe(true);
     expect(scopes.covers("agent-y", [textEdit])).toBe(false);
     expect(scopes.covers("agent-x", [])).toBe(false);
-    expect(scopes.covers("agent-x", [{ bundleId: null, name: "Unknown" }])).toBe(false);
+    expect(scopes.covers("agent-x", [{ bundleId: null, name: "Unknown", within: [] }])).toBe(false);
     scopes.clear("agent-x");
     expect(scopes.covers("agent-x", [textEdit])).toBe(false);
     scopes.allow("agent-x", "com.apple.TextEdit");

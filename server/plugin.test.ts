@@ -167,6 +167,8 @@ describe("computerise server entry", () => {
     await fake.permission({ id: "o1", name: "mcp__excalidraw__draw" });
     await fake.permission({ id: "o2", name: "CodexMcpElicitation", metadata: { serverName: "excalidraw" } });
     await fake.permission({ id: "o3", name: `mcp__${SERVER_NAME}-lookalike__click` });
+    await fake.permission({ id: "o4", name: `mcp__${SERVER_NAME}__other__click` });
+    await fake.permission({ id: "o5", name: `mcp__${SERVER_NAME}___click` });
     expect(fake.respondToPermission.mock.calls.map(([input]) => input)).toEqual([
       { requestId: "c1", response: { behavior: "allow" } },
       { requestId: "c2", response: { behavior: "allow" } },

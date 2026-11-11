@@ -4,7 +4,7 @@
 
 Computer use for any Paseo agent on macOS. Computerise gives Claude, Codex, OpenCode, and other MCP-capable agents tools to see and control the Mac running the Paseo daemon.
 
-Current release: **v0.5.1**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
+Current release: **v0.5.2**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
 
 ## What it provides
 
@@ -20,7 +20,7 @@ Current release: **v0.5.1**. Computerise follows [Semantic Versioning](https://s
 - An optional screenshot returned with any input action (`screenshot: true`)
 - One long-lived engine process, so each step takes milliseconds instead of a new process
 - Per-agent `off`, `ask`, and `auto` modes
-- Allow and Deny cards in agent chats, plus "Allow <app> this turn" for pointer actions
+- Allow and Deny cards in agent chats, plus "Allow <app> this turn" for pointer actions; each waiting request also shows a desktop notification naming the chat
 - A one-agent-at-a-time screen lease
 - Mandatory built-in blocks for Paseo, terminals, code-running apps, System Settings, and password managers, which also cover the apps inside their bundles
 - Global Stop and Resume controls

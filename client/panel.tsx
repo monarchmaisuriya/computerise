@@ -52,6 +52,7 @@ export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePan
   if (query.isPending) return <View style={[styles.screen, styles.content]}><Text style={styles.muted}>Loading computer status</Text></View>;
   if (query.error) return <View style={[styles.screen, styles.content]}><Text style={{ color: theme.colors.statusDanger }}>{errorText(query.error)}</Text></View>;
   const data = query.data;
+  const titleOf = (agentId: string) => agentQuery.data?.entries.find(({ agent }) => agent.id === agentId)?.agent.title ?? agentId;
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
       <Text style={styles.title}>Computer</Text>
@@ -107,7 +108,7 @@ export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePan
         {data.pending.map((pending) => (
           <View key={pending.requestId} style={{ gap: 6 }}>
             <Text style={styles.text}>{pending.action}</Text>
-            <Text style={styles.muted}>{pending.app} · {pending.agentId}</Text>
+            <Text style={styles.muted}>{pending.app} · {titleOf(pending.agentId)}</Text>
             <View style={styles.row}>
               {button("Allow", () => decide.mutate({ requestId: pending.requestId, agentId: pending.agentId, allow: true, scope: "once" }), true, decide.isPending)}
               {pending.appScope !== null && button(`Allow ${pending.appScope} this turn`, () => decide.mutate({ requestId: pending.requestId, agentId: pending.agentId, allow: true, scope: "app-for-turn" }), false, decide.isPending)}

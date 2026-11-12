@@ -241,6 +241,21 @@ describe("modes and the global stop", () => {
     expect(control.stopped()).toBe(true);
   });
 
+  // Lowering a mode takes effect before its write, like Off, so a Stop or another agent's Off saved
+  // during that write cannot bring the earlier, higher mode back.
+  it("applies auto to ask at once and keeps it when a Stop is saved during its write", async () => {
+    const root = tempDir("computerise-control-lower-");
+    const path = join(root, "control.json");
+    const control = await ControlStore.open(path);
+    await control.setMode("agent-x", "auto");
+
+    const lowering = control.setMode("agent-x", "ask");
+    expect(control.mode("agent-x")).toBe("ask");
+    await Promise.all([lowering, control.setStopped(true), control.setMode("agent-y", "off")]);
+    expect(control.mode("agent-x")).toBe("ask");
+    expect((await ControlStore.open(path)).mode("agent-x")).toBe("ask");
+  });
+
   it("applies safer Off and Stop transitions in memory even when persistence fails", async () => {
     const root = tempDir("computerise-control-safe-fail-");
     const path = join(root, "control.json");
@@ -249,6 +264,8 @@ describe("modes and the global stop", () => {
     await rm(path);
     await mkdir(path);
 
+    await expect(control.setMode("agent-x", "ask")).rejects.toThrow();
+    expect(control.mode("agent-x")).toBe("ask");
     await expect(control.setMode("agent-x", "off")).rejects.toThrow();
     expect(control.mode("agent-x")).toBe("off");
     await expect(control.setStopped(true)).rejects.toThrow();

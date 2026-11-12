@@ -29,7 +29,7 @@ const TOOL_ARGS: Record<string, Record<string, unknown>> = {
   drag: { from: [10, 10], to: [20, 20] },
   scroll: { x: 400, y: 220, direction: "down" },
   type: { text: "hello" },
-  key: { keys: "cmd+s" },
+  key: { keys: "Return" },
   open_app: { name: "Notes" },
   wait: { seconds: 0.1 },
   cursor_position: {},
@@ -473,7 +473,7 @@ describe("the computer MCP endpoint", () => {
       ["uiSnapshot", TEXTEDIT.pid],
       ["activate", "com.apple.Notes"],
       ["uiSnapshot", NOTES.pid],
-      ["key", "cmd+s"],
+      ["key", "Return"],
       ["uiSnapshot", NOTES.pid],
     ]);
   });
@@ -546,7 +546,7 @@ describe("the computer MCP endpoint", () => {
     const client = await agent("agent-x", "auto");
     await call(client, "screenshot");
     await call(client, "type", { text: "hi" });
-    await call(client, "key", { keys: "cmd+s" });
+    await call(client, "key", { keys: "Return" });
     expect(mac.effects().filter((effect) => effect.method === "type" || effect.method === "key").map((effect) => effect.args.at(-1))).toEqual(["com.apple.TextEdit", "com.apple.TextEdit"]);
   });
 
@@ -611,6 +611,146 @@ describe("the computer MCP endpoint", () => {
     expect(await second).toMatchObject({ isError: true, text: "The agent was switched to ask mode while this action waited; nothing was done" });
     expect(mac.calls.filter((entry) => entry.method === "click")).toHaveLength(1);
     expect(rows).toHaveLength(0);
+  });
+
+  // Holds the next call of one engine method until release() is called; held resolves once it waits.
+  function holdNext(method: "uiSnapshot" | "windowAt" | "type") {
+    let release!: () => void;
+    let reached!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const held = new Promise<void>((resolve) => (reached = resolve));
+    const original = mac.engine[method] as (...args: unknown[]) => Promise<unknown>;
+    let done = false;
+    (mac.engine as Record<string, unknown>)[method] = async (...args: unknown[]) => {
+      if (!done) {
+        done = true;
+        reached();
+        await gate;
+      }
+      return original(...args);
+    };
+    return { held, release };
+  }
+
+  const clicks = () => mac.calls.filter((entry) => entry.method === "click").length;
+
+  // The last check sits right before the input is posted, after the read of the controls, which can
+  // take seconds on a large app.
+  it.each(["off", "ask"] as const)("posts nothing when an auto agent is set to %s during the read before its click", async (lower) => {
+    const client = await agent("agent-x", "auto");
+    await call(client, "screenshot");
+    const snapshot = holdNext("uiSnapshot");
+    const click = call(client, "click", { x: 400, y: 220 });
+    await snapshot.held;
+    await computer.setMode("agent-x", lower);
+    snapshot.release();
+    expect((await click).isError).toBe(true);
+    expect(clicks()).toBe(0);
+    expect(rows).toHaveLength(0);
+  });
+
+  it("interrupts the step running for the agent holding the screen when its mode is lowered", async () => {
+    const client = await agent("agent-x", "auto");
+    await call(client, "screenshot");
+    const typing = holdNext("type");
+    const type = call(client, "type", { text: "hello" });
+    await typing.held;
+    await computer.setMode("agent-x", "ask");
+    expect(mac.calls.filter((entry) => entry.method === "interrupt")).toHaveLength(1);
+    typing.release();
+    await type;
+  });
+
+  it("leaves a chat's approvals and allowed apps alone when its mode is set to the mode it has", async () => {
+    const client = await agent("agent-x", "ask");
+    await call(client, "screenshot");
+    const click = call(client, "click", { x: 400, y: 220 });
+    const { row } = await nextRow(1);
+    await computer.setMode("agent-x", "ask");
+    expect(mac.calls.filter((entry) => entry.method === "interrupt")).toHaveLength(0);
+    approvals.answer(row.requestId, "agent-x", true);
+    expect((await click).isError).toBe(false);
+  });
+
+  // Paseo ends the turn (for example when the user interrupts the agent) while a click is still
+  // being planned; the plugin then withdraws the agent's requests and allowed apps.
+  it("asks nothing and allows no app after the turn ended while the action was planned", async () => {
+    const client = await agent("agent-x", "ask");
+    await call(client, "screenshot");
+    const planning = holdNext("windowAt");
+    const click = call(client, "click", { x: 400, y: 220 });
+    await planning.held;
+    approvals.cancelFor("agent-x");
+    lease.release("agent-x");
+    scopes.clear("agent-x");
+    planning.release();
+    expect((await click).text).toContain("The screen was released");
+    expect(rows).toHaveLength(0);
+    await call(client, "screenshot");
+    const next = call(client, "click", { x: 400, y: 220 });
+    approvals.answer((await nextRow(1)).row.requestId, "agent-x", false);
+    expect((await next).text).toContain("The user denied this action");
+    expect(clicks()).toBe(0);
+  });
+
+  it("refuses an approved action from an earlier turn once the agent holds the screen again", async () => {
+    const client = await agent("agent-x", "ask");
+    await call(client, "screenshot");
+    const planning = holdNext("uiSnapshot");
+    const click = call(client, "click", { x: 400, y: 220 });
+    approvals.answer((await nextRow(1)).row.requestId, "agent-x", true);
+    await planning.held;
+    lease.release("agent-x");
+    await call(client, "cursor_position");
+    lease.take("agent-x");
+    planning.release();
+    expect((await click).text).toContain("The screen was released");
+    expect(clicks()).toBe(0);
+  });
+
+  // MCP clients give up on a tool call after 60 seconds by default; the agent then retries, so the
+  // first call must not act afterwards.
+  it("withdraws the approval card and acts on nothing when the client stops waiting", async () => {
+    const client = await agent("agent-x", "ask");
+    await call(client, "screenshot");
+    const stop = new AbortController();
+    const click = client.callTool({ name: "click", arguments: { x: 400, y: 220 } }, undefined, { signal: stop.signal });
+    await nextRow(1);
+    stop.abort();
+    await expect(click).rejects.toThrow();
+    for (let i = 0; i < 100 && approvals.listPending().length > 0; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(approvals.listPending()).toEqual([]);
+    expect(clicks()).toBe(0);
+  });
+
+  it("posts nothing when the client stops waiting during the read before an auto click", async () => {
+    const client = await agent("agent-x", "auto");
+    await call(client, "screenshot");
+    const snapshot = holdNext("uiSnapshot");
+    const stop = new AbortController();
+    const click = client.callTool({ name: "click", arguments: { x: 400, y: 220 } }, undefined, { signal: stop.signal });
+    await snapshot.held;
+    stop.abort();
+    await expect(click).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    snapshot.release();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(clicks()).toBe(0);
+  });
+
+  // A combo with cmd, ctrl, or option can be another app's global shortcut (1Password's Quick
+  // Access is cmd+shift+space), which no front-app check sees, so it asks even in auto mode.
+  it("asks before a key combo with cmd, ctrl, or option even in auto mode, and not before a plain key", async () => {
+    const client = await agent("agent-x", "auto");
+    await call(client, "screenshot");
+    expect((await call(client, "key", { keys: "Return" })).isError).toBe(false);
+    expect(rows).toHaveLength(0);
+    const combo = call(client, "key", { keys: "cmd+shift+space" });
+    const { row } = await nextRow(1);
+    expect(row).toMatchObject({ action: "press cmd+shift+space", appScope: null });
+    approvals.answer(row.requestId, "agent-x", false);
+    expect((await combo).text).toContain("The user denied this action");
+    expect(mac.calls.filter((entry) => entry.method === "key")).toHaveLength(1);
   });
 
   it("reports an action that ran as done even when its audit write fails", async () => {

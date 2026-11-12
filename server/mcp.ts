@@ -1,13 +1,15 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { CancelledNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { Mode, Settings } from "../shared/contracts";
 import { type Approvals, type ApprovalScopes, singleApp } from "./approvals";
 import type { AuditLog } from "./audit";
 import { center, describeChange, describeElement, type ElementTables, type ExpectedElement, matchLive, pickElement } from "./elements";
 import { type Capture, LIMITS, type MacEngine, type MouseButton, type Point, type Rect, type ScreenStatus, type ScrollDirection, type UiSnapshot } from "./engine";
-import { type AppRef, blockLevel, type ControlStore, type Failsafe, type Lease, LeaseHeldError, type RateLimiter } from "./policy";
+import { canBeGlobalShortcut } from "./keys";
+import { type AppRef, blockLevel, type ControlStore, type Failsafe, type Lease, LeaseHeldError, MODE_RANK, type RateLimiter } from "./policy";
 import type { Seats } from "./seats";
 import type { TokenAuthority } from "./tokens";
 import type { PanelState } from "./panel-state";
@@ -30,6 +32,7 @@ export const OFF_MESSAGE = "Computer use is off for this agent; the user can tur
 const NOT_READY = "Computer use is not ready for this agent yet; try again in a moment";
 const STOPPED = "Computer use is stopped by the user; they can resume it from the Computer panel";
 const ELEMENT_OR_POINT = "Give either element, or both x and y";
+const CLIENT_GONE = "The client stopped waiting for this action; nothing was done";
 
 function auditFailed(error: unknown): void {
   console.error(`[computerise] audit write failed: ${String(error)}`);
@@ -96,6 +99,8 @@ type ActionSpec<A> = {
   // Pointer actions the user may allow for one app for the rest of the turn. Typing, keys, and
   // opening apps always ask.
   scopable?: true;
+  // Actions that ask even in auto mode, because no check on the front app can tell where they land.
+  alwaysAsks?(args: A): boolean;
   target(agentId: string, args: A, working: AppRef | null, planned: Target | null): Promise<Target>;
   describe(args: A, target: Target): string;
   act(args: A, target: Target): Promise<void>;
@@ -166,12 +171,19 @@ const pair = z.array(coordinate).length(2).describe("[x, y] in main-display poin
 const screenshotAfter = z.boolean().optional().describe("Also return a screenshot taken just after the action");
 const elementNumber = z.number().int().min(1).max(LIMITS.snapshotElements).optional().describe("A control's number from your last ui_snapshot, instead of x and y");
 
+function runningKey(seat: string, requestId: string | number): string {
+  return `${seat}\n${typeof requestId}:${String(requestId)}`;
+}
+
 function wantsScreenshot(args: unknown): boolean {
   return Reflect.get(Object(args), "screenshot") === true;
 }
 
 export class ComputerMcp {
   private executions: Promise<unknown> = Promise.resolve();
+  // Tool calls still running, by seat and request id. Each POST gets its own MCP server, so a
+  // client's cancellation arrives at a server that never saw the call and must find it here.
+  private readonly running = new Map<string, AbortController>();
   private readonly screenshotSpec: ReadSpec<Record<string, never>>;
 
   constructor(private readonly options: ComputerMcpOptions) {
@@ -248,6 +260,35 @@ export class ComputerMcp {
     if (persistenceError) throw persistenceError;
   }
 
+  // The one way to change an agent's mode. Whatever the old mode let it do (open requests, apps
+  // allowed this turn, element numbers) is withdrawn, and a lower mode also interrupts the step the
+  // agent is running, so nothing it started under the old mode keeps going. Setting the mode it
+  // already has changes nothing.
+  async setMode(agentId: string, mode: Mode): Promise<void> {
+    const { control, approvals, scopes, elements, lease, engine } = this.options;
+    const current = control.mode(agentId);
+    if (mode === current) return;
+    approvals.cancelFor(agentId);
+    scopes.clear(agentId);
+    elements.clear(agentId);
+    const saving = control.setMode(agentId, mode);
+    if (MODE_RANK[mode] < MODE_RANK[current] && lease.holderId() === agentId) engine.interrupt();
+    await saving;
+  }
+
+  // Checked before anything touches the Mac and again right before the input is posted: a Stop, Off,
+  // a switch to ask for an action nobody approved, the end of the turn, or a client that stopped
+  // waiting refuses the action.
+  private requireMayAct(agentId: string, approved: boolean, turn: number, signal: AbortSignal | undefined): void {
+    if (signal?.aborted) throw new Refusal(CLIENT_GONE);
+    if (this.requireRunning(agentId) === "ask" && !approved) throw new Refusal("The agent was switched to ask mode while this action waited; nothing was done");
+    this.requireTurn(agentId, turn);
+  }
+
+  private requireTurn(agentId: string, turn: number): void {
+    if (!this.options.lease.holds(agentId, turn)) throw new Refusal("The screen was released while this action waited (for example, the agent's turn ended); take a new screenshot");
+  }
+
   private requireRunning(agentId: string): Mode {
     if (this.options.control.stopped()) throw new Refusal(STOPPED);
     const mode = this.options.control.mode(agentId);
@@ -301,27 +342,29 @@ export class ComputerMcp {
     return { content: result.content, target: front?.bundleId ?? null };
   }
 
-  private async act<A>(agentId: string, mode: Mode, spec: ActionSpec<A>, args: A, settings: Settings) {
-    const { approvals, scopes, lease } = this.options;
-    const working = lease.workingApp(agentId);
+  // turn is the lease turn the action was planned in; signal aborts when the client stops waiting.
+  private async act<A>(agentId: string, mode: Mode, spec: ActionSpec<A>, args: A, settings: Settings, turn: number, signal: AbortSignal | undefined) {
+    const { approvals, scopes } = this.options;
+    const working = this.options.lease.workingApp(agentId);
     if (spec.needsWorkingApp && working === null) throw new Refusal("Take a screenshot first, so the plugin knows which app you are working in");
     const planned = await spec.target(agentId, args, working, null);
     this.requireInputAllowed(planned.apps, settings);
     const description = spec.describe(args, planned);
-    if (mode === "ask" && !(spec.scopable && scopes.covers(agentId, planned.apps))) {
+    const asks = mode === "ask" || spec.alwaysAsks?.(args) === true;
+    if (asks && !(spec.scopable && scopes.covers(agentId, planned.apps))) {
+      // Planning awaited, so the turn may have ended; a card shown now would outlive it.
+      this.requireTurn(agentId, turn);
       const scopeApp = spec.scopable ? singleApp(planned.apps) : null;
-      const decision = await approvals.request(agentId, description, [...new Set(planned.apps.map((app) => app.name))].join(", "), scopeApp?.name ?? null);
+      const decision = await approvals.request(agentId, description, [...new Set(planned.apps.map((app) => app.name))].join(", "), scopeApp?.name ?? null, signal);
       if (decision === "deny") throw new Refusal("The user denied this action");
       if (decision === "timeout") throw new Refusal("The user did not answer in time; nothing was done");
-      if (decision === "cancelled") throw new Refusal("The request was withdrawn before it was answered (Stop, a mode change, or the end of the agent's turn); nothing was done");
+      if (decision === "cancelled") throw new Refusal("The request was withdrawn before it was answered (Stop, a mode change, the end of the agent's turn, or the client stopped waiting); nothing was done");
       this.requireRunning(agentId);
+      this.requireTurn(agentId, turn);
       if (decision === "allow-app" && scopeApp) scopes.allow(agentId, scopeApp.bundleId);
     }
     return this.exclusive(async () => {
-      // Before anything touches the Mac. An action queued in auto was never approved, so a switch to
-      // ask while it waited refuses it.
-      if (this.requireRunning(agentId) === "ask" && mode === "auto") throw new Refusal("The agent was switched to ask mode while this action waited; nothing was done");
-      if (lease.holderId() !== agentId) throw new Refusal("The screen was released while this action waited (for example, the agent's turn ended); take a new screenshot");
+      this.requireMayAct(agentId, asks, turn, signal);
       if (spec.needsWorkingApp && working !== null) await this.bringForward(working);
       const actual = await spec.target(agentId, args, working, planned);
       if (!sameApps(planned.apps, actual.apps)) throw new Refusal("The screen changed while waiting; take a new screenshot");
@@ -335,7 +378,15 @@ export class ComputerMcp {
       this.requireInputAllowed(actual.apps, executionSettings);
       const max = this.options.elements.get(agentId)?.max ?? SNAPSHOT_ELEMENTS;
       const before = actual.live && actual.element ? { pid: actual.element.pid, elements: actual.live.elements } : await this.controlsBefore(executionStatus, executionSettings, max);
-      await spec.act(args, actual);
+      // The read above can take seconds, so everything is checked again right before the input.
+      this.requireMayAct(agentId, asks, turn, signal);
+      const interrupt = () => this.options.engine.interrupt();
+      signal?.addEventListener("abort", interrupt, { once: true });
+      try {
+        await spec.act(args, actual);
+      } finally {
+        signal?.removeEventListener("abort", interrupt);
+      }
       spec.after?.(agentId, args, actual);
       const observed: Observed = { before, max };
       return { content: textContent(`Done: ${description}`), target: actual.apps.map((app) => app.bundleId).join(","), observed };
@@ -377,8 +428,9 @@ export class ComputerMcp {
   // afterAction marks the reads that report an action's own result: they keep the agent's own
   // pointer placement excused (Failsafe.tripped), never change the working app (read), and never take
   // the screen back for an agent that let go of it during the action (turn end, close).
-  private async onScreen<A>(agentId: string, mode: Mode, spec: ReadSpec<A> | ActionSpec<A>, args: A, afterAction = false): Promise<{ content: Content[]; target: string | null; observed?: Observed }> {
+  private async onScreen<A>(agentId: string, mode: Mode, spec: ReadSpec<A> | ActionSpec<A>, args: A, afterAction = false, signal?: AbortSignal): Promise<{ content: Content[]; target: string | null; observed?: Observed }> {
     const { engine, failsafe, lease } = this.options;
+    let turn = 0;
     const status = await engine.status();
     if (failsafe.tripped(status.cursor, { keepPlacement: afterAction })) {
       await this.stopAll();
@@ -388,14 +440,16 @@ export class ComputerMcp {
       if (lease.holderId() !== agentId) throw new Refusal("The screen was released after this action (for example, the agent's turn ended)");
     } else {
       try {
-        lease.take(agentId);
+        turn = lease.take(agentId);
       } catch (error) {
         if (error instanceof LeaseHeldError) throw new Refusal(`Agent ${await this.options.agentTitle(error.holder)} is using the screen`);
         throw error;
       }
     }
     const settings = await this.options.settings();
-    return spec.kind === "read" ? this.read(agentId, spec, args, status, settings, afterAction) : this.act(agentId, mode, spec, args, settings);
+    if (spec.kind === "read") return this.read(agentId, spec, args, status, settings, afterAction);
+    if (afterAction) throw new Error("An action cannot run as the read after an action");
+    return this.act(agentId, mode, spec, args, settings, turn, signal);
   }
 
   private async statusReport(agentId: string): Promise<string> {
@@ -425,7 +479,7 @@ export class ComputerMcp {
   // Every tool runs through here, in this order: identity, stop, mode, rate limit, then (for tools
   // that touch the screen) corner failsafe, lease, and the read or action path. status skips only the
   // stop and mode checks (InfoSpec). Argument schemas are checked by the MCP server before.
-  private async call<A>(seat: string, tool: string, spec: ToolSpec<A>, args: A) {
+  private async call<A>(seat: string, tool: string, spec: ToolSpec<A>, args: A, signal?: AbortSignal) {
     const { seats, calls, rates, audit } = this.options;
     let agentId: string | null = null;
     let target: string | null = null;
@@ -437,7 +491,7 @@ export class ComputerMcp {
       calls.take(agentId);
       if (spec.kind === "action") rates.take(agentId);
       const result =
-        spec.kind === "pause" ? { content: await spec.run(args), target: null } : spec.kind === "info" ? { content: await spec.run(agentId), target: null } : await this.onScreen(agentId, mode, spec, args);
+        spec.kind === "pause" ? { content: await spec.run(args), target: null } : spec.kind === "info" ? { content: await spec.run(agentId), target: null } : await this.onScreen(agentId, mode, spec, args, false, signal);
       target = result.target;
       // The tool already ran, so a failed audit write must not tell the agent it failed (it would retry).
       await audit.record({ agentId, tool, target, outcome: "ok", chars }).catch(auditFailed);
@@ -462,8 +516,25 @@ export class ComputerMcp {
     const mcp = new McpServer({ name: SERVER_NAME, version: PLUGIN_VERSION });
     // Annotations are hints for clients; the pipeline above is what enforces the rules.
     const register = <A>(name: (typeof TOOL_NAMES)[number], title: string, description: string, inputSchema: z.ZodRawShape, spec: ToolSpec<A>) => {
-      mcp.registerTool(name, { title, description, inputSchema, annotations: { readOnlyHint: spec.kind !== "action" } }, (args: unknown) => this.call(seat, name, spec, args as A));
+      mcp.registerTool(name, { title, description, inputSchema, annotations: { readOnlyHint: spec.kind !== "action" } }, async (args: unknown, extra: { signal: AbortSignal; requestId: string | number }) => {
+        const key = runningKey(seat, extra.requestId);
+        const cancel = new AbortController();
+        const closed = () => cancel.abort();
+        if (extra.signal.aborted) cancel.abort();
+        else extra.signal.addEventListener("abort", closed, { once: true });
+        this.running.set(key, cancel);
+        try {
+          return await this.call(seat, name, spec, args as A, cancel.signal);
+        } finally {
+          extra.signal.removeEventListener("abort", closed);
+          if (this.running.get(key) === cancel) this.running.delete(key);
+        }
+      });
     };
+    // Replaces the SDK's own handler, which only knows this POST's requests.
+    mcp.server.setNotificationHandler(CancelledNotificationSchema, ({ params }) => {
+      if (params.requestId !== undefined) this.running.get(runningKey(seat, params.requestId))?.abort();
+    });
     // A point given directly, or the middle of a control from the agent's last ui_snapshot. Before
     // acting, the control's window is read again and must still list that control under the number
     // the user approved; the point then comes from that fresh read.
@@ -596,7 +667,7 @@ export class ComputerMcp {
         target: pointerTarget,
         describe: ({ button = "left", count = 1, modifiers = [] }, target) =>
           `click ${button}${count > 1 ? ` x${count}` : ""}${modifiers.length ? ` with ${modifiers.join("+")}` : ""} ${target.element ? "on" : "at"} ${where(target)} on ${target.apps[0].name}`,
-        act: ({ button = "left", count = 1, modifiers = [] }, target) => engine.click(pointOf(target), { button, count, modifiers }),
+        act: ({ button = "left", count = 1, modifiers = [] }, target) => engine.click(pointOf(target), { button, count, modifiers }, target.apps[0]),
         after: (_agentId, _args, target) => failsafe.notePlaced(pointOf(target)),
       },
     );
@@ -612,7 +683,7 @@ export class ComputerMcp {
         scopable: true,
         target: pointerTarget,
         describe: (_args, target) => `move the pointer to ${where(target)} over ${target.apps[0].name}`,
-        act: (_args, target) => engine.move(pointOf(target)),
+        act: (_args, target) => engine.move(pointOf(target), target.apps[0]),
         after: (_agentId, _args, target) => failsafe.notePlaced(pointOf(target)),
       },
     );
@@ -623,7 +694,7 @@ export class ComputerMcp {
       scopable: true,
       target: async (_agentId, { from, to }) => ({ apps: [await this.appAt({ x: from[0], y: from[1] }), await this.appAt({ x: to[0], y: to[1] })], point: null, element: null }),
       describe: ({ from, to }, { apps: [start, end] }) => `drag from ${at({ x: from[0], y: from[1] })} on ${start.name} to ${at({ x: to[0], y: to[1] })} on ${end.name}`,
-      act: ({ from, to }) => engine.drag({ x: from[0], y: from[1] }, { x: to[0], y: to[1] }),
+      act: ({ from, to }, { apps: [fromApp, toApp] }) => engine.drag({ x: from[0], y: from[1] }, { x: to[0], y: to[1] }, { from: fromApp, to: toApp }),
       after: (_agentId, { to }) => failsafe.notePlaced({ x: to[0], y: to[1] }),
     });
 
@@ -645,7 +716,7 @@ export class ComputerMcp {
         scopable: true,
         target: pointerTarget,
         describe: ({ direction, amount = 3 }, target) => `scroll ${direction} ${amount} ${target.element ? "on" : "at"} ${where(target)} on ${target.apps[0].name}`,
-        act: ({ direction, amount = 3 }, target) => engine.scroll(pointOf(target), direction, amount),
+        act: ({ direction, amount = 3 }, target) => engine.scroll(pointOf(target), direction, amount, target.apps[0]),
         after: (_agentId, _args, target) => failsafe.notePlaced(pointOf(target)),
       },
     );
@@ -668,6 +739,7 @@ export class ComputerMcp {
         kind: "action",
         needsWorkingApp: true,
         target: keyboardTarget,
+        alwaysAsks: ({ keys }) => canBeGlobalShortcut(keys),
         describe: ({ keys, repeat = 1 }) => `press ${keys}${repeat > 1 ? ` x${repeat}` : ""}`,
         act: ({ keys, repeat = 1 }, { apps: [app] }) => engine.key(keys, repeat, receiverId(app)),
       },

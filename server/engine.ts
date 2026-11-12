@@ -81,6 +81,8 @@ const snapshotSchema = z.object({
 export type ScreenStatus = z.infer<typeof statusSchema>;
 export type Display = z.infer<typeof displaySchema>;
 export type WindowOwner = NonNullable<z.infer<typeof windowOwnerSchema>>;
+// What decides an app's block level: its bundle id and the apps whose bundles contain it.
+export type WindowIdentity = { bundleId: string | null; within: readonly string[] };
 export type AppInfo = NonNullable<z.infer<typeof appSchema>>;
 export type ScreenWindow = z.infer<typeof screenWindowsSchema>[number];
 export type UiSnapshot = z.infer<typeof snapshotSchema>;
@@ -204,33 +206,36 @@ export class MacEngine {
     return status.display;
   }
 
-  private async pointer(input: object, end: Point): Promise<void> {
-    requireCursorAt(await this.script("pointer", input, pointSchema), end);
+  // owners are the apps the caller checked at each point; the script refuses to post if another
+  // app's window is there when it runs.
+  private async pointer(input: object, owners: readonly (Point & WindowIdentity)[], end: Point): Promise<void> {
+    const expect = owners.map(({ x, y, bundleId, within }) => ({ x, y, bundleId, within }));
+    requireCursorAt(await this.script("pointer", { ...input, expect }, pointSchema), end);
   }
 
-  async move(point: Point): Promise<void> {
+  async move(point: Point, owner: WindowIdentity): Promise<void> {
     requireOnDisplay(point, await this.controllableDisplay());
-    await this.pointer({ action: "move", ...point }, point);
+    await this.pointer({ action: "move", ...point }, [{ ...point, ...owner }], point);
   }
 
-  async click(point: Point, options: { button: MouseButton; count: number; modifiers: readonly string[] }): Promise<void> {
+  async click(point: Point, options: { button: MouseButton; count: number; modifiers: readonly string[] }, owner: WindowIdentity): Promise<void> {
     requireIntIn("click count", options.count, 1, LIMITS.clickCount);
     const flags = modifierFlags(options.modifiers);
     requireOnDisplay(point, await this.controllableDisplay());
-    await this.pointer({ action: "click", ...point, button: BUTTON_NUMBER[options.button], count: options.count, flags }, point);
+    await this.pointer({ action: "click", ...point, button: BUTTON_NUMBER[options.button], count: options.count, flags }, [{ ...point, ...owner }], point);
   }
 
-  async drag(from: Point, to: Point): Promise<void> {
+  async drag(from: Point, to: Point, owners: { from: WindowIdentity; to: WindowIdentity }): Promise<void> {
     const display = await this.controllableDisplay();
     requireOnDisplay(from, display, "drag start");
     requireOnDisplay(to, display, "drag end");
-    await this.pointer({ action: "drag", from, to }, to);
+    await this.pointer({ action: "drag", from, to }, [{ ...from, ...owners.from }, { ...to, ...owners.to }], to);
   }
 
-  async scroll(point: Point, direction: ScrollDirection, amount: number): Promise<void> {
+  async scroll(point: Point, direction: ScrollDirection, amount: number, owner: WindowIdentity): Promise<void> {
     requireIntIn("scroll amount", amount, 1, LIMITS.scrollAmount);
     requireOnDisplay(point, await this.controllableDisplay());
-    await this.pointer({ action: "scroll", ...point, ...SCROLL_TICK[direction], ticks: amount }, point);
+    await this.pointer({ action: "scroll", ...point, ...SCROLL_TICK[direction], ticks: amount }, [{ ...point, ...owner }], point);
   }
 
   // receiver is the bundle id of the app the caller checked; keys stop if another app is in front.

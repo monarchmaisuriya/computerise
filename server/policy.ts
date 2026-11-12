@@ -39,8 +39,11 @@ export class LeaseHeldError extends Error {
 
 // One agent drives the mouse and keyboard at a time. The lease also remembers the app that agent is
 // working in, so actions approved later still go to that app.
+// Each take by an agent that did not hold the screen starts a new turn number, so an action planned
+// before a release (turn end, close, Stop, idle) can tell it no longer holds the screen it planned on.
 export class Lease {
-  private holder: { agentId: string; workingApp: AppRef | null; lastCall: number } | null = null;
+  private holder: { agentId: string; workingApp: AppRef | null; lastCall: number; turn: number } | null = null;
+  private turns = 0;
 
   constructor(
     private readonly idleMs: number,
@@ -52,15 +55,25 @@ export class Lease {
     return this.holder;
   }
 
-  take(agentId: string): void {
+  take(agentId: string): number {
     const holder = this.current();
     if (holder && holder.agentId !== agentId) throw new LeaseHeldError(holder.agentId);
-    if (holder) holder.lastCall = this.now();
-    else this.holder = { agentId, workingApp: null, lastCall: this.now() };
+    if (holder) {
+      holder.lastCall = this.now();
+      return holder.turn;
+    }
+    this.turns += 1;
+    this.holder = { agentId, workingApp: null, lastCall: this.now(), turn: this.turns };
+    return this.turns;
   }
 
   holderId(): string | null {
     return this.current()?.agentId ?? null;
+  }
+
+  holds(agentId: string, turn: number): boolean {
+    const holder = this.current();
+    return holder?.agentId === agentId && holder.turn === turn;
   }
 
   release(agentId: string): void {
@@ -128,6 +141,9 @@ export class Failsafe {
   }
 }
 
+// How much each mode allows; a lower rank never allows anything a higher one does not.
+export const MODE_RANK: Record<Mode, number> = { off: 0, ask: 1, auto: 2 };
+
 // version 2: an agent without a saved mode is in DEFAULT_MODE. Files without it are older, when
 // such an agent was off.
 const controlSchema = z.object({ version: z.literal(2).optional(), modes: z.record(z.string(), modeSchema), stopped: z.boolean() });
@@ -161,9 +177,12 @@ export class ControlStore {
     return { ...this.state.modes };
   }
 
+  // A mode that allows less (auto to ask, anything to off) is the safer change, so it applies at once
+  // and wins over any save in flight; a mode that allows more applies only once it is saved.
   setMode(agentId: string, mode: Mode): Promise<void> {
     const parsed = modeSchema.parse(mode);
-    return this.save((current) => ({ ...current, modes: { ...current.modes, [agentId]: parsed } }), parsed === "off");
+    const lowers = MODE_RANK[parsed] <= MODE_RANK[this.mode(agentId)];
+    return this.save((current) => ({ ...current, modes: { ...current.modes, [agentId]: parsed } }), lowers);
   }
 
   setStopped(stopped: boolean): Promise<void> {
@@ -198,7 +217,7 @@ export class ControlStore {
         const revision = this.revision;
         const next = change(this.state);
         await writeJsonFile(this.path, next);
-        // A safer Stop/Off/removal may have happened while this write was in flight. Its queued
+        // A safer change (Stop, a lower mode, a removal) may have happened during this write. Its queued
         // snapshot will repair disk next; never overwrite that safer in-memory state here.
         if (this.revision === revision) this.state = next;
       });

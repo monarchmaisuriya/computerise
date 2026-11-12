@@ -11,6 +11,8 @@ import { tempDir } from "./test-temp-dir";
 type Call = { file: string; args: readonly string[] };
 
 const DISPLAY = { width: 1512, height: 982, scale: 2 };
+// The app a pointer action was checked against, which the pointer script checks again before posting.
+const OWNER = { bundleId: "com.apple.TextEdit", within: [] };
 
 function scriptName(args: readonly string[]): ScriptName {
   const entry = Object.entries(SCRIPTS).find(([, source]) => source === args[3]);
@@ -145,19 +147,19 @@ describe("identifying apps", () => {
 describe("pointer and keyboard actions", () => {
   it("clicks with the button, count, and modifier flags it was given", async () => {
     const mac = fakeMac();
-    await engineOn(mac).click({ x: 400, y: 220 }, { button: "right", count: 2, modifiers: ["cmd", "shift"] });
+    await engineOn(mac).click({ x: 400, y: 220 }, { button: "right", count: 2, modifiers: ["cmd", "shift"] }, OWNER);
     const pointer = mac.calls.find((call) => call.file === "osascript" && scriptName(call.args) === "pointer");
-    expect(scriptInput(pointer!)).toEqual({ action: "click", x: 400, y: 220, button: 1, count: 2, flags: 0x100000 | 0x20000 });
+    expect(scriptInput(pointer!)).toEqual({ action: "click", x: 400, y: 220, button: 1, count: 2, flags: 0x100000 | 0x20000, expect: [{ x: 400, y: 220, ...OWNER }] });
   });
 
   it("refuses every input action when Paseo lacks Accessibility, before posting anything", async () => {
     const mac = fakeMac({ trusted: false });
     const engine = engineOn(mac);
     const actions = [
-      () => engine.click({ x: 10, y: 10 }, { button: "left", count: 1, modifiers: [] }),
-      () => engine.move({ x: 10, y: 10 }),
-      () => engine.drag({ x: 10, y: 10 }, { x: 20, y: 20 }),
-      () => engine.scroll({ x: 10, y: 10 }, "down", 3),
+      () => engine.click({ x: 10, y: 10 }, { button: "left", count: 1, modifiers: [] }, OWNER),
+      () => engine.move({ x: 10, y: 10 }, OWNER),
+      () => engine.drag({ x: 10, y: 10 }, { x: 20, y: 20 }, { from: OWNER, to: OWNER }),
+      () => engine.scroll({ x: 10, y: 10 }, "down", 3, OWNER),
       () => engine.type("hello", "com.apple.TextEdit"),
       () => engine.key("cmd+s", 1, "com.apple.TextEdit"),
     ];
@@ -168,37 +170,45 @@ describe("pointer and keyboard actions", () => {
   it("refuses points off the main display instead of clamping them", async () => {
     const mac = fakeMac();
     const engine = engineOn(mac);
-    await expect(engine.move({ x: 1512, y: 10 })).rejects.toThrow("The point (1512, 10) is outside the main display (1512 x 982 points)");
-    await expect(engine.move({ x: -1, y: 10 })).rejects.toThrow("outside the main display");
-    await expect(engine.move({ x: Number.NaN, y: 10 })).rejects.toThrow("Expected finite coordinates for the point, got (NaN, 10)");
-    await expect(engine.drag({ x: 10, y: 10 }, { x: 10, y: 982 })).rejects.toThrow("The drag end (10, 982) is outside the main display");
+    await expect(engine.move({ x: 1512, y: 10 }, OWNER)).rejects.toThrow("The point (1512, 10) is outside the main display (1512 x 982 points)");
+    await expect(engine.move({ x: -1, y: 10 }, OWNER)).rejects.toThrow("outside the main display");
+    await expect(engine.move({ x: Number.NaN, y: 10 }, OWNER)).rejects.toThrow("Expected finite coordinates for the point, got (NaN, 10)");
+    await expect(engine.drag({ x: 10, y: 10 }, { x: 10, y: 982 }, { from: OWNER, to: OWNER })).rejects.toThrow("The drag end (10, 982) is outside the main display");
     expect(mac.calls.some((call) => scriptName(call.args) === "pointer")).toBe(false);
   });
 
   it("reports failure when the pointer did not end where the action put it", async () => {
     const mac = fakeMac({ cursorAfter: () => ({ x: 0, y: 0 }) });
-    await expect(engineOn(mac).click({ x: 400, y: 220 }, { button: "left", count: 1, modifiers: [] })).rejects.toThrow(
+    await expect(engineOn(mac).click({ x: 400, y: 220 }, { button: "left", count: 1, modifiers: [] }, OWNER)).rejects.toThrow(
       "The pointer is at (0, 0) after the action, not (400, 220); macOS dropped the input",
     );
+  });
+
+  it("asks the pointer script to check both ends of a drag before pressing", async () => {
+    const mac = fakeMac();
+    const elsewhere = { bundleId: "com.apple.Notes", within: [] };
+    await engineOn(mac).drag({ x: 10, y: 10 }, { x: 20, y: 20 }, { from: OWNER, to: elsewhere });
+    const pointer = mac.calls.find((call) => call.file === "osascript" && scriptName(call.args) === "pointer");
+    expect(scriptInput(pointer!).expect).toEqual([{ x: 10, y: 10, ...OWNER }, { x: 20, y: 20, ...elsewhere }]);
   });
 
   it("scrolls by signed wheel ticks for each direction", async () => {
     const mac = fakeMac();
     const engine = engineOn(mac);
-    await engine.scroll({ x: 50, y: 60 }, "down", 4);
-    await engine.scroll({ x: 50, y: 60 }, "left", 2);
+    await engine.scroll({ x: 50, y: 60 }, "down", 4, OWNER);
+    await engine.scroll({ x: 50, y: 60 }, "left", 2, OWNER);
     const inputs = mac.calls.filter((call) => scriptName(call.args) === "pointer").map(scriptInput);
     expect(inputs).toEqual([
-      { action: "scroll", x: 50, y: 60, dy: -1, dx: 0, ticks: 4 },
-      { action: "scroll", x: 50, y: 60, dy: 0, dx: 1, ticks: 2 },
+      { action: "scroll", x: 50, y: 60, dy: -1, dx: 0, ticks: 4, expect: [{ x: 50, y: 60, ...OWNER }] },
+      { action: "scroll", x: 50, y: 60, dy: 0, dx: 1, ticks: 2, expect: [{ x: 50, y: 60, ...OWNER }] },
     ]);
   });
 
   it("refuses counts, repeats, and amounts outside their ranges", async () => {
     const engine = engineOn(fakeMac());
-    await expect(engine.click({ x: 1, y: 1 }, { button: "left", count: 4, modifiers: [] })).rejects.toThrow("Expected click count 1 to 3, got 4");
+    await expect(engine.click({ x: 1, y: 1 }, { button: "left", count: 4, modifiers: [] }, OWNER)).rejects.toThrow("Expected click count 1 to 3, got 4");
     await expect(engine.key("a", 0, "com.apple.TextEdit")).rejects.toThrow("Expected key repeat 1 to 20, got 0");
-    await expect(engine.scroll({ x: 1, y: 1 }, "up", 21)).rejects.toThrow("Expected scroll amount 1 to 20, got 21");
+    await expect(engine.scroll({ x: 1, y: 1 }, "up", 21, OWNER)).rejects.toThrow("Expected scroll amount 1 to 20, got 21");
     await expect(engine.uiSnapshot(42, 401)).rejects.toThrow("Expected max elements 1 to 400, got 401");
   });
 

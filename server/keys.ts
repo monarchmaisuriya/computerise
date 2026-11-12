@@ -51,3 +51,9 @@ export function parseKeyCombo(combo: string): KeyCombo {
   if (code === undefined) throw new Error(`Unknown key "${keyName}" in "${combo}"; use names like a, Return, Tab, Escape, Page_Down, F5`);
   return { code, flags: modifierFlags(parts) };
 }
+
+// cmd, ctrl, or option combos can be another app's global shortcut, which macOS hands to that app
+// whichever app is in front.
+export function canBeGlobalShortcut(combo: string): boolean {
+  return (parseKeyCombo(combo).flags & (COMMAND | CONTROL | OPTION)) !== 0;
+}

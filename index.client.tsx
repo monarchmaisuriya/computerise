@@ -3,13 +3,13 @@ import { ApprovalNotices, desktopNotifier } from "./client/approval-notices";
 import { ApprovalRow } from "./client/approval-row";
 import { parseComputerCommand } from "./client/commands";
 import { ComputerPanel } from "./client/panel";
-import { contributePills } from "./client/pills";
+import { contributeModeHeader } from "./client/mode-header";
 import { ComputerSettingsScreen } from "./client/settings-screen";
 import { APPROVAL_ROW_KIND, approvalRowSchema, setModeRpc, setStopRpc, statusRpc } from "./shared/contracts";
 
 export default function contribute(client: PluginClientContext) {
   const removers = [
-    contributePills(client, new ApprovalNotices(desktopNotifier())),
+    contributeModeHeader(client, new ApprovalNotices(desktopNotifier())),
     client.addWorkspacePanel({ id: "computer", title: "Computer", icon: "MonitorCog", locations: ["workspace", "explorer"], Component: ComputerPanel }),
     client.addSettingsScreen({ id: "computer", title: "Computerise", icon: "MonitorCog", Component: ComputerSettingsScreen }),
     client.addTimelineRenderer({ kind: APPROVAL_ROW_KIND, version: 1, schema: approvalRowSchema, Component: ApprovalRow }),

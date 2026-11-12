@@ -47,41 +47,54 @@ function run() {
   });
 }`;
 
-// The window a mouse-down at the point would hit, by macOS's own hit test. The topmost window in
-// the window list is not it: Notification Centre keeps an opaque, click-through, full-screen window
-// at layer 21. The hit test returns 0 until NSApplication connects to the window server. It takes
-// Cocoa coordinates, whose origin is the bottom-left of the main display.
-const windowAt = String.raw`
-ObjC.import('AppKit');
-ObjC.import('CoreGraphics');
-${ENCLOSING_APPS}
-function run(argv) {
-  var input = JSON.parse(argv[0]);
+// The owner of the window a mouse-down at (x, y) would hit, by macOS's own hit test, or null. The
+// topmost window in the window list is not it: Notification Centre keeps an opaque, click-through,
+// full-screen window at layer 21. The hit test returns 0 until NSApplication connects to the window
+// server. It takes Cocoa coordinates, whose origin is the bottom-left of the main display. Needs
+// AppKit, CoreGraphics, and ENCLOSING_APPS.
+const WINDOW_OWNER_AT = String.raw`
+function windowOwnerAt(x, y) {
   $.NSApplication.sharedApplication;
   var mainHeight = $.NSScreen.screens.objectAtIndex(0).frame.size.height;
-  var hit = Number($.NSWindow.windowNumberAtPointBelowWindowWithWindowNumber({ x: input.x, y: mainHeight - input.y }, 0));
-  if (hit === 0) return JSON.stringify(null);
+  var hit = Number($.NSWindow.windowNumberAtPointBelowWindowWithWindowNumber({ x: x, y: mainHeight - y }, 0));
+  if (hit === 0) return null;
   var onScreenOnly = 1;
   var windows = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(onScreenOnly, 0)));
   for (var i = 0; i < windows.length; i++) {
     var w = windows[i];
     if (w.kCGWindowNumber !== hit) continue;
     var app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(w.kCGWindowOwnerPID);
-    return JSON.stringify({
+    return {
       pid: w.kCGWindowOwnerPID,
       name: w.kCGWindowOwnerName || '',
       bundleId: app.isNil() ? null : (ObjC.unwrap(app.bundleIdentifier) || null),
       within: runningAppWithin(app),
       layer: w.kCGWindowLayer
-    });
+    };
   }
-  return JSON.stringify(null);
+  return null;
+}`;
+
+const windowAt = String.raw`
+ObjC.import('AppKit');
+ObjC.import('CoreGraphics');
+${ENCLOSING_APPS}
+${WINDOW_OWNER_AT}
+function run(argv) {
+  var input = JSON.parse(argv[0]);
+  return JSON.stringify(windowOwnerAt(input.x, input.y));
 }`;
 
 // Moves, clicks, drags, or scrolls, then prints where the pointer ended up. Without Accessibility,
-// macOS drops posted events silently, so the caller compares this read-back with the target.
+// macOS drops posted events silently, so the caller compares this read-back with the target. Before
+// the first event, each expected point must still be over a window of the app the caller checked;
+// a window that appeared there since (even a few seconds earlier, during the caller's reads) stops
+// the action with nothing posted.
 const pointer = String.raw`
+ObjC.import('AppKit');
 ObjC.import('CoreGraphics');
+${ENCLOSING_APPS}
+${WINDOW_OWNER_AT}
 var MOVED = 5, DOWN = [1, 3, 25], UP = [2, 4, 26], LEFT_DRAGGED = 6, CLICK_STATE = 1, HID_TAP = 0, LINE_UNITS = 1;
 function post(type, x, y, button, flags, clickState) {
   var e = $.CGEventCreateMouseEvent(null, type, { x: x, y: y }, button);
@@ -92,6 +105,12 @@ function post(type, x, y, button, flags, clickState) {
 }
 function run(argv) {
   var a = JSON.parse(argv[0]);
+  for (var i = 0; i < a.expect.length; i++) {
+    var e = a.expect[i], o = windowOwnerAt(e.x, e.y);
+    if (o === null || o.bundleId !== e.bundleId || JSON.stringify(o.within) !== JSON.stringify(e.within)) {
+      throw new Error('The window under (' + e.x + ', ' + e.y + ') changed before the input, so nothing was done; take a new screenshot');
+    }
+  }
   if (a.action === 'move') {
     post(MOVED, a.x, a.y, 0, 0, 0);
   } else if (a.action === 'click') {
@@ -281,13 +300,15 @@ function run(argv) {
 
 // Every on-screen window of every process, with its app's bundle id (null when unknown), the apps
 // that contain it, and its bounds in points. Owners and bounds are readable without Screen Recording.
+// Desktop-level windows are included: a display capture shows them (Finder's desktop icons), so an
+// app hidden from view must have them blacked out too.
 const onScreenWindows = String.raw`
 ObjC.import('AppKit');
 ObjC.import('CoreGraphics');
 ${ENCLOSING_APPS}
 function run() {
-  var onScreenOnly = 1, excludeDesktop = 16;
-  var windows = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(onScreenOnly | excludeDesktop, 0)));
+  var onScreenOnly = 1;
+  var windows = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(onScreenOnly, 0)));
   var apps = {}, out = [];
   for (var i = 0; i < windows.length; i++) {
     var w = windows[i], b = w.kCGWindowBounds, pid = w.kCGWindowOwnerPID;

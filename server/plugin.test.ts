@@ -191,7 +191,7 @@ describe("computerise server entry", () => {
 
   it.each([
     ["forgets", "the agent closes", (fake: ReturnType<typeof start>) => fake.closed("agent-x"), true],
-    ["forgets", "the mode changes", (fake: ReturnType<typeof start>) => fake.call("computer.mode.set", { agentId: "agent-x", mode: "auto" }), true],
+    ["forgets", "the mode changes", (fake: ReturnType<typeof start>) => fake.call("computer.mode.set", { agentId: "agent-x", mode: "ask" }), true],
     ["keeps", "the turn ends", (fake: ReturnType<typeof start>) => fake.turnEnded("agent-x"), false],
   ])("%s element numbers when %s", async (_verb, _event, happen, forgotten) => {
     const fake = start();
@@ -306,7 +306,13 @@ describe("computerise server entry", () => {
   it.each([
     ["the turn ends", (fake: ReturnType<typeof start>) => fake.turnEnded("agent-x")],
     ["the agent closes", (fake: ReturnType<typeof start>) => fake.closed("agent-x")],
-    ["the mode changes", (fake: ReturnType<typeof start>) => fake.call("computer.mode.set", { agentId: "agent-x", mode: "ask" })],
+    [
+      "the mode changes",
+      async (fake: ReturnType<typeof start>) => {
+        await fake.call("computer.mode.set", { agentId: "agent-x", mode: "auto" });
+        await fake.call("computer.mode.set", { agentId: "agent-x", mode: "ask" });
+      },
+    ],
   ])("asks again for an app allowed for the turn once %s", async (_event, happen) => {
     const fake = start();
     const x = await createAgent(fake, "agent-x");

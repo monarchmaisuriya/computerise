@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { center } from "./elements";
-import { MacEngine, runFile } from "./engine";
+import { MacEngine, runFile, type WindowOwner } from "./engine";
 import { ENCLOSING_APPS, SCRIPTS } from "./engine-scripts";
 import { ScriptHost } from "./script-host";
 import { tempDir } from "./test-temp-dir";
@@ -165,7 +165,7 @@ describe.runIf(process.env.COMPUTERISE_LIVE === "1")("the engine on this Mac", (
     const owners = await Promise.all(inWindow.map(async (element) => (await engine.windowAt(center(element.frame as [number, number, number, number])))?.bundleId));
     const text = inWindow.find((element) => element.role === "AXTextArea");
     const point = center(text?.frame as [number, number, number, number]);
-    await engine.click(point, { button: "left", count: 1, modifiers: [] });
+    await engine.click(point, { button: "left", count: 1, modifiers: [] }, { bundleId: "com.apple.TextEdit", within: [] });
     const after = await engine.status();
     await bringForward(before);
     expect(owners.length).toBeGreaterThan(0);
@@ -186,7 +186,26 @@ describe.runIf(process.env.COMPUTERISE_LIVE === "1")("the engine on this Mac", (
   it("posts pointer input through the host", async () => {
     const { cursor } = await engine.status();
     const target = { x: Math.round(cursor.x), y: Math.round(cursor.y) };
-    await engine.move(target);
+    const owner = await engine.windowAt(target);
+    expect(owner, "no window is under the pointer").not.toBeNull();
+    await engine.move(target, owner as WindowOwner);
     expect((await engine.status()).cursor).toEqual(target);
+  });
+
+  // The app under the point is checked again inside the script, right before the first event.
+  it("posts nothing when another app's window is under the point than the one checked", async () => {
+    const { cursor } = await engine.status();
+    const start = { x: Math.round(cursor.x), y: Math.round(cursor.y) };
+    const target = { x: start.x > 20 ? start.x - 10 : start.x + 10, y: start.y > 20 ? start.y - 10 : start.y + 10 };
+    await expect(engine.move(target, { bundleId: "com.example.not-this-app", within: [] })).rejects.toThrow("changed before the input");
+    expect((await engine.status()).cursor).toEqual(start);
+  });
+
+  // A display capture shows desktop-level windows such as Finder's desktop icons, so the list the
+  // hidden windows are taken from must include them.
+  it("lists desktop-level windows, such as Finder's desktop", async () => {
+    const { display } = await engine.status();
+    const finder = (await engine.onScreenWindows()).filter((window) => window.bundleId === "com.apple.finder");
+    expect(finder.some((window) => window.width >= display.width && window.height >= display.height)).toBe(true);
   });
 });

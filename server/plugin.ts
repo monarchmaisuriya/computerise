@@ -281,11 +281,8 @@ export function contributeComputer(server: PluginServerContext, options: Compute
 
   server.handle(setModeRpc, async ({ agentId, mode }, { paseo: api }) => {
     remember(api);
-    const { control, scopes, elements, approvals } = await requireRuntime();
-    approvals.cancelFor(agentId);
-    scopes.clear(agentId);
-    elements.clear(agentId);
-    await control.setMode(agentId, mode);
+    const { computer } = await requireRuntime();
+    await computer.setMode(agentId, mode);
     return { mode };
   });
 

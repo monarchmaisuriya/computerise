@@ -24,9 +24,9 @@ export class Approvals {
   ) {}
 
   // appScope names the app the user may allow for the rest of the turn, or null when the action
-  // must always ask. The request is registered before any wait, so a Stop, mode change, or turn end
-  // always withdraws it.
-  async request(agentId: string, action: string, app: string, appScope: string | null = null): Promise<Decision> {
+  // must always ask. The request is registered before any wait, so a Stop, mode change, turn end, or
+  // a client that stopped waiting (signal) always withdraws it.
+  async request(agentId: string, action: string, app: string, appScope: string | null = null, signal?: AbortSignal): Promise<Decision> {
     const requestId = randomUUID();
     const rowId = `approval-${requestId}`;
     const row: ApprovalRow = { requestId, action, app, status: "pending", appScope };
@@ -36,6 +36,8 @@ export class Approvals {
     });
     const shown = this.rows.show(agentId, rowId, row);
     this.pending.set(requestId, { agentId, rowId, row, shown, resolve: resolveDecision, timer: null });
+    if (signal?.aborted) this.finish(requestId, "cancelled");
+    else signal?.addEventListener("abort", () => this.finish(requestId, "cancelled"), { once: true });
     try {
       const [timeoutMs] = await Promise.all([this.timeoutMs(), shown]);
       const pending = this.pending.get(requestId);

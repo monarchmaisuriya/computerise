@@ -4,7 +4,7 @@
 
 Computer use for any Paseo agent on macOS. Computerise gives Claude, Codex, OpenCode, and other MCP-capable agents tools to see and control the Mac running the Paseo daemon.
 
-Current release: **v0.5.2**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
+Current release: **v0.6.0**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
 
 ## What it provides
 
@@ -47,7 +47,7 @@ In an agent composer:
 /computer status
 ```
 
-The composer pill and the **Computer** workspace panel provide the same controls. New agents start in ask mode; agents that had the computer tools before v0.5.0 stay off until you choose a mode, and a child of an agent that is off starts off. Ask mode requires approval for every input action; read-only screenshots and accessibility snapshots never ask. For clicks, moves, drags, and scrolls, **Allow <app> this turn** also allows later pointer actions in that same app until the agent's turn ends; typing, key presses, opening apps, and drags between two apps always ask. Requests still waiting when the turn ends, the agent closes, or its mode changes are withdrawn.
+The **Computer** button in the workspace header sets the mode of every chat in that workspace at once; its label shows the shared mode, or "Computer mixed" when the chats differ. `/computer` and the **Computer** workspace panel set one chat at a time. New agents start in ask mode; agents that had the computer tools before v0.5.0 stay off until you choose a mode, and a child of an agent that is off starts off. Ask mode requires approval for every input action; read-only screenshots and accessibility snapshots never ask. For clicks, moves, drags, and scrolls, **Allow <app> this turn** also allows later pointer actions in that same app until the agent's turn ends; typing, key presses, opening apps, and drags between two apps always ask. Key presses with cmd, ctrl, or option ask even in auto mode, because they can be another app's global shortcut. Requests still waiting when the turn ends, the agent closes, its mode changes, or the agent's tool call times out are withdrawn. Turning an agent off, or from auto to ask, interrupts the step it is running.
 
 ## Security model
 
@@ -55,7 +55,7 @@ New agents start in ask mode, so they can take screenshots and accessibility sna
 
 Ask mode helps prevent mistakes and prompt-injected actions, but it is not a security boundary against an already-hostile agent with arbitrary local command access. See [OVERVIEW.md](OVERVIEW.md) for the complete safety and data notes.
 
-Screenshots capture the full main display by default. Turn on **Show agents only the front app** in the plugin settings to send only the front app's windows, at their real positions, with the rest of the screen black. Computerise refuses capture when a password manager is frontmost, and paints the windows of password managers and apps hidden in the settings black in full-display screenshots and zooms. An app inside a blocked app's bundle, such as the Passwords menu-bar helper, is hidden and blocked the same way as that app.
+Screenshots capture the full main display by default. Turn on **Show agents only the front app** in the plugin settings to send only the front app's windows, at their real positions, with the rest of the screen black. Computerise refuses capture when a password manager is frontmost, and paints the windows of password managers and apps hidden in the settings black in full-display screenshots and zooms, including desktop-level windows such as Finder's desktop icons. A click, move, drag, or scroll is checked again right before it is posted, and does nothing if another app's window has appeared under it. An app inside a blocked app's bundle, such as the Passwords menu-bar helper, is hidden and blocked the same way as that app.
 
 ## Development
 

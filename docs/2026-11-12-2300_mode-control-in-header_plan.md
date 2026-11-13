@@ -1,7 +1,7 @@
 # Move the computer-use mode control into the workspace header
 
 - Date: 2026-11-12 23:00
-- Status: in progress (part 3 of 3: release)
+- Status: done (part 3 of 3)
 - Repos: computerise   Folders: client/, docs root files   Files: client/pills.ts (replaced), client/pills.test.ts (replaced), client/mode-header.ts (new), client/mode-header.test.ts (new), index.client.tsx, README.md, OVERVIEW.md, version files
 - Subagents: none
 
@@ -106,8 +106,8 @@ Release v0.6.0 (M runs `gh release create`, as before), then `paseo plugin updat
 - [x] Fix confirmed findings after M picks which. Done: tests and typecheck green.
 
 ### Part 3: Release and reinstall
-- [ ] Bump to 0.6.0, commit (M's go), tag, push, M runs the release command. Done: release URL.
-- [ ] Update the plugin on M's daemon. Done: `paseo plugin ls` shows v0.6.0 commit; header shows the button.
+- [x] Bump to 0.6.0, commit (M's go), tag, push, M runs the release command. Done: release URL.
+- [x] Update the plugin on M's daemon. Done: `paseo plugin ls` shows v0.6.0 commit; header shows the button.
 
 ## Standardized review
 
@@ -130,6 +130,7 @@ Plan rubric, reviewed by the author against the repository and Paseo v0.16.0-bet
 - Part 1: `client/mode-header.ts` replaces `client/pills.ts`; one header button per workspace sets every chat with the computer tools. Tests 9 of 9 (whole file red first; three mutants each caught). Full suite 252 passed, 10 skipped; typecheck clean. Live on a throwaway 0.16.0-beta.2 daemon: header shows the mode, composer pill gone, "Computer mixed" after `/computer off` on one of two chats, menu stayed open 7 s, "Automatic for all 2 chats" set both, the other workspace stayed "Computer asks", no console errors.
 
 - Part 2: whole-codebase review at `docs/2026-11-12-2330_whole-codebase_review.md`: 6 blocking, 2 must-verify, 13 notes, all candidates refuted independently and standing. M chose to fix 1-6, 8, note 13, and 7 as "modifier combos ask in auto"; all fixed with failing-first tests and mutant probes. Suite 264 passed, 12 skipped; live suite 12 of 12 on this Mac; header rechecked live on the throwaway daemon. Version 0.6.0.
+- Part 3: v0.6.0 committed (`0369068`), tagged, pushed; M published the GitHub Release on 2026-11-12; `paseo plugin update computerise --ref v0.6.0` moved M's daemon to `0369068`, running. The header button showed in M's desktop app (M's screenshot, 2026-11-13). Follow-up the same session: the menu marks the shared mode with a check, shipped in v0.7.0.
 
 ## Open questions
 

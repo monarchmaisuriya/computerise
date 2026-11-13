@@ -1,7 +1,7 @@
 # Let approvals wait up to 30 minutes
 
 - Date: 2026-11-13 13:00
-- Status: in progress (part 3 of 3: release)
+- Status: done (part 3 of 3)
 - Repos: computerise   Folders: shared/, server/, client/, docs root files   Files: shared/contracts.ts, client/settings-screen.tsx, client/settings-draft.ts, server/tokens.ts, server/plugin.ts, server/mcp.ts, server/policy.ts, tests, README.md, OVERVIEW.md, version files
 - Subagents: none
 
@@ -95,7 +95,7 @@ Release v0.7.0, reinstall; new chats get the long wait. Rollback: set the wait t
 - [x] Claude env on create, lease keep-alive, progress notifications (HTTP limit dropped, see Design 5). Done: tests for the env, keep-alive past 120 s, and progress sent; live check on a throwaway daemon with a Claude chat answering after 6 minutes.
 
 ### Part 3: Docs, release, reinstall
-- [ ] README, OVERVIEW, version 0.7.0, commit (M's go), tag, push, M runs the release, reinstall. Done: `paseo plugin ls` shows the new revision.
+- [x] README, OVERVIEW, version 0.7.0, commit (M's go), tag, push, M runs the release, reinstall. Done: `paseo plugin ls` shows the new revision.
 
 ## Standardized review
 
@@ -117,6 +117,7 @@ Plan rubric, self-review against the repository and Paseo v0.16.0-beta.2 source.
 - Part 1: `APPROVAL_TIMEOUT_SECONDS` (5 to 1800, default 60) in `shared/contracts.ts`, used by the schema and the settings parser; token claim `waitSeconds`; `Approvals.request` caps at `maxWaitMs`; each MCP call carries its token's wait (55 s without the claim). Tests red first; mutant "ignore the token" caught.
 - Part 2: Claude chats get `MCP_TOOL_TIMEOUT=1860000` (a larger existing value is kept) and a 1800-second claim; a waiting card keeps the lease turn alive (`Lease.keepAlive`) and sends progress every 30 s when the client asked for progress. Tests red first; three mutants caught. Suite 273 passed. Live: the new chat's Claude process has `MCP_TOOL_TIMEOUT=1860000`; an `open_app` card waited from 07:43:00 to 07:49:51 UTC (past Claude's 5-minute idle limit) and the chat got "The user denied this action" when denied, so Claude accepts the progress notifications.
 - Header check mark (from the same session) and docs; version 0.7.0.
+- Part 3: v0.7.0 committed (`9eed6f7`), tagged, pushed; M published the GitHub Release on 2026-11-13; `paseo plugin update computerise --ref v0.7.0` moved M's daemon to `9eed6f7`, running. Registry PR getpaseo/plugins#2392 opened. M's saved wait stays 45 seconds until M changes it.
 
 ## Open questions
 

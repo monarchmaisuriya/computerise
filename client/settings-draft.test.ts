@@ -7,11 +7,12 @@ describe("computer settings drafts", () => {
     expect(() => parseBundleIds("not a bundle")).toThrow('Expected a bundle id like com.apple.TextEdit, got "not a bundle"');
   });
 
-  it("accepts only approval timeouts from 5 to 55 seconds", () => {
+  it("accepts only approval timeouts from 5 seconds to 30 minutes", () => {
     expect(parseTimeout("5")).toBe(5);
-    expect(parseTimeout("55")).toBe(55);
-    expect(() => parseTimeout("")).toThrow("Expected approval timeout from 5 to 55 seconds, got an empty value");
-    expect(() => parseTimeout("0")).toThrow("Expected approval timeout from 5 to 55 seconds, got 0");
+    expect(parseTimeout("1800")).toBe(1800);
+    expect(() => parseTimeout("")).toThrow("Expected approval timeout from 5 to 1800 seconds, got an empty value");
+    expect(() => parseTimeout("0")).toThrow("Expected approval timeout from 5 to 1800 seconds, got 0");
+    expect(() => parseTimeout("1801")).toThrow("Expected approval timeout from 5 to 1800 seconds, got 1801");
     expect(() => parseTimeout("5.5")).toThrow('Expected a whole number for approval timeout, got "5.5"');
   });
 });

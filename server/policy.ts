@@ -71,6 +71,13 @@ export class Lease {
     return this.current()?.agentId ?? null;
   }
 
+  // Counts as a call: an action waiting for the user's answer keeps the screen, so no other agent
+  // takes it meanwhile. A turn that was released or lapsed stays gone.
+  keepAlive(agentId: string, turn: number): void {
+    const holder = this.current();
+    if (holder?.agentId === agentId && holder.turn === turn) holder.lastCall = this.now();
+  }
+
   holds(agentId: string, turn: number): boolean {
     const holder = this.current();
     return holder?.agentId === agentId && holder.turn === turn;

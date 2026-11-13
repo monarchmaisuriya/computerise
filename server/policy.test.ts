@@ -57,10 +57,11 @@ describe("the blocklist", () => {
 });
 
 describe("the settings document", () => {
-  it("defaults the approval timeout to 45 seconds and refuses values outside 5 to 55", () => {
-    expect(defaults.approvalTimeoutSeconds).toBe(45);
-    expect(settingsSchema.safeParse({ approvalTimeoutSeconds: 0 }).success).toBe(false);
-    expect(settingsSchema.safeParse({ approvalTimeoutSeconds: 56 }).success).toBe(false);
+  it("defaults the approval timeout to 60 seconds and refuses values outside 5 seconds to 30 minutes", () => {
+    expect(defaults.approvalTimeoutSeconds).toBe(60);
+    expect(settingsSchema.safeParse({ approvalTimeoutSeconds: 1800 }).success).toBe(true);
+    expect(settingsSchema.safeParse({ approvalTimeoutSeconds: 4 }).success).toBe(false);
+    expect(settingsSchema.safeParse({ approvalTimeoutSeconds: 1801 }).success).toBe(false);
     expect(settingsSchema.safeParse({ extraNoInput: ["not a bundle id; rm"] }).success).toBe(false);
   });
 
@@ -113,6 +114,24 @@ describe("the lease", () => {
     lease.take("agent-x");
     lease.releaseAll();
     lease.take("agent-y");
+  });
+
+  // An approval can wait up to 30 minutes, longer than the 120-second idle time; the waiting action
+  // keeps its turn alive so no other agent takes the screen meanwhile.
+  it("keeps a waiting holder's turn alive past the idle time, and never revives a released turn", () => {
+    let now = 0;
+    const lease = new Lease(120_000, () => now);
+    const turn = lease.take("agent-x");
+    now = 100_000;
+    lease.keepAlive("agent-x", turn);
+    now = 200_000;
+    expect(lease.holds("agent-x", turn)).toBe(true);
+    expect(() => lease.take("agent-y")).toThrow(LeaseHeldError);
+    lease.release("agent-x");
+    lease.keepAlive("agent-x", turn);
+    expect(lease.holds("agent-x", turn)).toBe(false);
+    lease.keepAlive("agent-y", turn);
+    expect(lease.holderId()).toBeNull();
   });
 
   it("keeps the working app with the holder and drops it with the lease", () => {

@@ -25,8 +25,9 @@ export class Approvals {
 
   // appScope names the app the user may allow for the rest of the turn, or null when the action
   // must always ask. The request is registered before any wait, so a Stop, mode change, turn end, or
-  // a client that stopped waiting (signal) always withdraws it.
-  async request(agentId: string, action: string, app: string, appScope: string | null = null, signal?: AbortSignal): Promise<Decision> {
+  // a client that stopped waiting (signal) always withdraws it. maxWaitMs is how long the agent's
+  // client waits for the call; the card never outlives it.
+  async request(agentId: string, action: string, app: string, appScope: string | null = null, { signal, maxWaitMs = Infinity }: { signal?: AbortSignal; maxWaitMs?: number } = {}): Promise<Decision> {
     const requestId = randomUUID();
     const rowId = `approval-${requestId}`;
     const row: ApprovalRow = { requestId, action, app, status: "pending", appScope };
@@ -41,7 +42,7 @@ export class Approvals {
     try {
       const [timeoutMs] = await Promise.all([this.timeoutMs(), shown]);
       const pending = this.pending.get(requestId);
-      if (pending) pending.timer = setTimeout(() => this.finish(requestId, "timeout"), timeoutMs);
+      if (pending) pending.timer = setTimeout(() => this.finish(requestId, "timeout"), Math.min(timeoutMs, maxWaitMs));
     } catch (error) {
       const timer = this.pending.get(requestId)?.timer;
       if (timer) clearTimeout(timer);

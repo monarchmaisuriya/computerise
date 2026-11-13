@@ -19,6 +19,23 @@ describe("approvals", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
+  // An agent's MCP client stops waiting for a tool call after its own limit; a card that outlived
+  // it could be approved after the agent was told the call failed.
+  it("waits no longer than the agent's client allows, even when the setting is longer", async () => {
+    const rows = fakeRows();
+    const approvals = new Approvals(rows.rows, async () => 600_000);
+    const decision = approvals.request("agent-x", "click left at (400, 220)", "TextEdit", null, { maxWaitMs: 55_000 });
+    await settle();
+    await vi.advanceTimersByTimeAsync(55_000);
+    expect(await decision).toBe("timeout");
+    const longer = approvals.request("agent-x", "click left at (400, 220)", "TextEdit", null, { maxWaitMs: 1_800_000 });
+    await settle();
+    await vi.advanceTimersByTimeAsync(599_000);
+    expect(approvals.listPending()).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await longer).toBe("timeout");
+  });
+
   it("withdraws a request cancelled while its timeout setting is still being read", async () => {
     const rows = fakeRows();
     let timeoutRead!: (ms: number) => void;

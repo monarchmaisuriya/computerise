@@ -17,6 +17,14 @@ describe("bearer tokens", () => {
     expect(tokens.verify(undefined)).toBeNull();
   });
 
+  // The wait is how long the agent's MCP client waits for one tool call; tokens minted before it
+  // existed carry none and stay valid.
+  it("carries how long the agent's client waits, and accepts tokens without it", () => {
+    const tokens = new TokenAuthority(randomBytes(32));
+    expect(tokens.verify(`Bearer ${tokens.mint({ seat: "seat-1", waitSeconds: 1800 })}`)).toEqual({ seat: "seat-1", waitSeconds: 1800 });
+    expect(tokens.verify(`Bearer ${tokens.mint({ seat: "seat-2" })}`)).toEqual({ seat: "seat-2" });
+  });
+
   it("keeps the secret in a file only the user can read, and reuses it", async () => {
     const root = tempDir("computerise-secret-");
     const first = await loadTokenSecret(root);

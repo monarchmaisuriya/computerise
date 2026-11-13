@@ -6,7 +6,7 @@ import { contributeModeHeader } from "./mode-header";
 
 type Observer = { snapshot(page: unknown): void; update(message: unknown): void };
 type Chat = { id: string; workspaceId: string; title: string };
-type Item = { title: string; behavior: { onPress(): Promise<void> } };
+type Item = { title: string; icon?: string; behavior: { onPress(): Promise<void> } };
 type Header = { workspaceId: string; button: Record<string, unknown>; updates: Record<string, unknown>[]; removed: boolean };
 
 // A stand-in for the Paseo client: the status RPC answers from modes, header buttons record their updates.
@@ -84,6 +84,15 @@ describe("the workspace header mode button", () => {
     expect(items(fake.headers[0]).map((item) => item.title)).toEqual(["Off", "Ask before actions", "Automatic"]);
   });
 
+  // Paseo focuses the first row when a menu opens, which looks like a selection; the check shows
+  // the mode the chats are actually in.
+  it("checks the mode the workspace's chats share, and no mode while they differ", async () => {
+    const fake = await started({ "agent-1": "ask", "agent-2": "off", "agent-3": "auto" }, [slack, notes, other]);
+    const [ws1, ws2] = live(fake);
+    expect(items(ws1).map((item) => item.icon ?? null)).toEqual([null, null, null]);
+    expect(items(ws2).map((item) => item.icon ?? null)).toEqual([null, null, "Check"]);
+  });
+
   // Paseo closes an open header menu whenever an update carries a behavior, so a refresh that finds
   // nothing new must not touch the button.
   it("leaves the button alone while nothing changes, so an open menu stays open", async () => {
@@ -103,7 +112,10 @@ describe("the workspace header mode button", () => {
     await items(ws1)[2].behavior.onPress();
     await settle();
     expect(fake.modes).toEqual({ "agent-1": "auto", "agent-2": "auto", "agent-3": "off" });
-    expect(ws1.updates).toEqual([{ title: "Computer-use mode for all 2 chats in this workspace", label: "Computer auto" }]);
+    expect(ws1.updates).toHaveLength(1);
+    const update = ws1.updates[0] as { title: string; label: string; behavior: { items: Item[] } };
+    expect(update).toMatchObject({ title: "Computer-use mode for all 2 chats in this workspace", label: "Computer auto" });
+    expect(update.behavior.items.map((item) => item.icon ?? null)).toEqual([null, null, "Check"]);
     expect(ws2.updates).toEqual([]);
   });
 
@@ -128,7 +140,7 @@ describe("the workspace header mode button", () => {
     expect(fake.modes["agent-1"]).toBe("off");
   });
 
-  it("resends the menu only when the workspace's chat count changes", async () => {
+  it("resends the menu only when the chat count or the shared mode changes", async () => {
     const fake = await started({ "agent-1": "ask", "agent-2": "ask" }, [slack]);
     fake.upsert(notes);
     await settle();

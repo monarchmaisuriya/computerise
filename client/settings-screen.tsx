@@ -43,7 +43,7 @@ export function ComputerSettingsScreen({ theme }: PluginSurfaceProps) {
     <>
       <SettingsSection title="Approvals">
         <SettingsCard>
-          <SettingsInput label="Wait for an answer (seconds)" hint="From 5 to 55. Default 45. An unanswered action does nothing." initialValue={String(settings.values.approvalTimeoutSeconds)} disabled={settings.saving} onChangeText={setTimeoutDraft} />
+          <SettingsInput label="Wait for an answer (seconds)" hint="From 5 to 1800 (30 minutes). Default 60. An unanswered action does nothing. Codex chats, and chats created before v0.7.0, stop waiting after 55." initialValue={String(settings.values.approvalTimeoutSeconds)} disabled={settings.saving} onChangeText={setTimeoutDraft} />
         </SettingsCard>
       </SettingsSection>
       <SettingsSection title="Privacy">

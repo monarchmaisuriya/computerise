@@ -2,10 +2,13 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
+import { APPROVAL_TIMEOUT_SECONDS } from "../shared/contracts";
 
 const SECRET_BYTES = 32;
 
-const tokenScopeSchema = z.object({ seat: z.string().min(1) });
+// waitSeconds is how long the agent's MCP client waits for one tool call, when the plugin raised it
+// at creation; without it the client gives up after about a minute.
+const tokenScopeSchema = z.object({ seat: z.string().min(1), waitSeconds: z.number().int().min(1).max(APPROVAL_TIMEOUT_SECONDS.max).optional() });
 export type TokenScope = z.infer<typeof tokenScopeSchema>;
 
 // Copied from memorise's mcp-auth.ts. Paseo saves injected MCP entries with the agent and reuses

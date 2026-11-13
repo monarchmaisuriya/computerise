@@ -111,6 +111,22 @@ describe("computerise server entry", () => {
     return { text: (result.content as { text?: string }[]).flatMap((part) => (part.text ? [part.text] : [])).join("\n"), isError: result.isError === true };
   }
 
+  // Claude gives up on an HTTP MCP call after 60 seconds unless MCP_TOOL_TIMEOUT is higher; the
+  // plugin raises it for the chats it equips and signs the new limit into the chat's token, so an
+  // approval card can wait up to 30 minutes. Paseo passes Codex no per-server timeout, so Codex keeps
+  // the 60-second limit and a token without the claim.
+  it.each([
+    ["a Claude chat", { provider: "claude", cwd: "/tmp" }, undefined, "1860000", 1800],
+    ["a Claude chat that already waits longer", { provider: "claude", cwd: "/tmp" }, { MCP_TOOL_TIMEOUT: "3600000" }, "3600000", 1800],
+    ["a Codex chat", { provider: "codex", cwd: "/tmp" }, undefined, undefined, undefined],
+  ])("sets how long %s waits for a tool call, and signs it into its token", async (_name, config, env, timeout, waitSeconds) => {
+    const fake = start();
+    const created = await fake.create(config, env);
+    expect(created.env?.MCP_TOOL_TIMEOUT).toBe(timeout);
+    const token = String(created.config.mcpServers[SERVER_NAME].headers.Authorization).replace("Bearer ", "");
+    expect(JSON.parse(Buffer.from(token.split(".")[0], "base64url").toString()).waitSeconds).toBe(waitSeconds);
+  });
+
   it("gives a new macOS agent the tool server, a seat, preapproved tools, and the prompt note, keeping other plugins' entries", async () => {
     const fake = start();
     const { config, env } = await fake.create({ provider: "claude", cwd: "/tmp", systemPrompt: "Be brief.", mcpServers: other, toolPolicy: { preapproved: [otherApproval] } });

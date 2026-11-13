@@ -4,10 +4,14 @@ import { z } from "zod";
 export const modeSchema = z.enum(["off", "ask", "auto"]);
 export type Mode = z.infer<typeof modeSchema>;
 
+// How long an approval card waits for the user. A card also never waits longer than the agent's own
+// MCP client waits for the call; see the token's waitSeconds.
+export const APPROVAL_TIMEOUT_SECONDS = { min: 5, max: 1800, default: 60 } as const;
+
 export const bundleIdSchema = z.string().max(200).regex(/^[A-Za-z0-9][A-Za-z0-9.-]*$/, "Expected a bundle id like com.apple.TextEdit");
 
 export const settingsSchema = z.object({
-  approvalTimeoutSeconds: z.number().int().min(5).max(55).default(45),
+  approvalTimeoutSeconds: z.number().int().min(APPROVAL_TIMEOUT_SECONDS.min).max(APPROVAL_TIMEOUT_SECONDS.max).default(APPROVAL_TIMEOUT_SECONDS.default),
   extraNoInput: z.array(bundleIdSchema).max(100).default([]),
   extraNoView: z.array(bundleIdSchema).max(100).default([]),
   // "front-app" shows the model only the front app's windows; the rest of the display is black.

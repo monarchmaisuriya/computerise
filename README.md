@@ -4,7 +4,7 @@
 
 Computer use for any Paseo agent on macOS. Computerise gives Claude, Codex, OpenCode, and other MCP-capable agents tools to see and control the Mac running the Paseo daemon.
 
-Current release: **v0.6.0**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
+Current release: **v0.7.0**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
 
 ## What it provides
 
@@ -47,7 +47,7 @@ In an agent composer:
 /computer status
 ```
 
-The **Computer** button in the workspace header sets the mode of every chat in that workspace at once; its label shows the shared mode, or "Computer mixed" when the chats differ. `/computer` and the **Computer** workspace panel set one chat at a time. New agents start in ask mode; agents that had the computer tools before v0.5.0 stay off until you choose a mode, and a child of an agent that is off starts off. Ask mode requires approval for every input action; read-only screenshots and accessibility snapshots never ask. For clicks, moves, drags, and scrolls, **Allow <app> this turn** also allows later pointer actions in that same app until the agent's turn ends; typing, key presses, opening apps, and drags between two apps always ask. Key presses with cmd, ctrl, or option ask even in auto mode, because they can be another app's global shortcut. Requests still waiting when the turn ends, the agent closes, its mode changes, or the agent's tool call times out are withdrawn. Turning an agent off, or from auto to ask, interrupts the step it is running.
+The **Computer** button in the workspace header sets the mode of every chat in that workspace at once; its label shows the shared mode, or "Computer mixed" when the chats differ, and its menu marks the shared mode with a check. `/computer` and the **Computer** workspace panel set one chat at a time. New agents start in ask mode; agents that had the computer tools before v0.5.0 stay off until you choose a mode, and a child of an agent that is off starts off. Ask mode requires approval for every input action; read-only screenshots and accessibility snapshots never ask. An approval waits up to **Wait for an answer** in the plugin settings (5 seconds to 30 minutes, default 1 minute); Codex chats, and chats created before v0.7.0, stop waiting after 55 seconds because their client gives up on the call. For clicks, moves, drags, and scrolls, **Allow <app> this turn** also allows later pointer actions in that same app until the agent's turn ends; typing, key presses, opening apps, and drags between two apps always ask. Key presses with cmd, ctrl, or option ask even in auto mode, because they can be another app's global shortcut. Requests still waiting when the turn ends, the agent closes, its mode changes, or the agent's tool call times out are withdrawn. Turning an agent off, or from auto to ask, interrupts the step it is running.
 
 ## Security model
 

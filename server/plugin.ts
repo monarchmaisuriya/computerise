@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { z } from "zod";
-import { answerApprovalRpc, APPROVAL_ROW_KIND, computerSettings, type healthSchema, panelHealthRpc, panelScreenshotRpc, panelStatusRpc, permissionActionRpc, type Settings, setModeRpc, setStopRpc, statusRpc } from "../shared/contracts";
+import { answerApprovalRpc, APPROVAL_ROW_KIND, APPROVAL_TIMEOUT_SECONDS, computerSettings, type healthSchema, panelHealthRpc, panelScreenshotRpc, panelStatusRpc, permissionActionRpc, type Settings, setModeRpc, setStopRpc, statusRpc } from "../shared/contracts";
 import { Approvals, ApprovalScopes } from "./approvals";
 import { AuditLog } from "./audit";
 import { ElementTables } from "./elements";
@@ -21,6 +21,17 @@ export const SEAT_ENV = "COMPUTERISE_SEAT";
 export const PROMPT_SECTION_START = "<computerise>";
 const PROMPT_SECTION_END = "</computerise>";
 const LEASE_IDLE_MS = 120_000;
+// Claude gives up on an HTTP MCP call after 60 seconds unless MCP_TOOL_TIMEOUT is higher. The plugin
+// raises it for the Claude chats it equips to the longest approval wait plus a minute for the action
+// itself, and signs that wait into the chat's token so a card never waits past it. Paseo passes Codex
+// no per-server timeout, so Codex chats keep the 60-second limit.
+const CLAUDE_TOOL_TIMEOUT_MS = (APPROVAL_TIMEOUT_SECONDS.max + 60) * 1_000;
+
+function clientWait(provider: string, env: Record<string, string>): { env: Record<string, string>; waitSeconds?: number } {
+  if (provider !== "claude") return { env: {} };
+  const timeout = Math.max(Number(env.MCP_TOOL_TIMEOUT) || 0, CLAUDE_TOOL_TIMEOUT_MS);
+  return { env: { MCP_TOOL_TIMEOUT: String(timeout) }, waitSeconds: APPROVAL_TIMEOUT_SECONDS.max };
+}
 const ACTIONS_PER_MINUTE = 60;
 const CALLS_PER_MINUTE = 120;
 const MINUTE_MS = 60_000;
@@ -193,13 +204,14 @@ export function contributeComputer(server: PluginServerContext, options: Compute
       if (port === null) return { ...request, env, config: stripped };
       const seat = seats.mint();
       const ownTools = TOOL_NAMES.map((tool) => ({ kind: "mcp" as const, server: SERVER_NAME, tool }));
+      const wait = clientWait(config.provider, env);
       return {
         ...request,
-        env: { ...env, [SEAT_ENV]: seat },
+        env: { ...env, ...wait.env, [SEAT_ENV]: seat },
         config: {
           ...stripped,
           systemPrompt: withSection(stripped.systemPrompt),
-          mcpServers: { ...mcpServers, ...mcpServerEntry(port, tokens.mint({ seat })) },
+          mcpServers: { ...mcpServers, ...mcpServerEntry(port, tokens.mint({ seat, ...(wait.waitSeconds === undefined ? {} : { waitSeconds: wait.waitSeconds }) })) },
           toolPolicy: { ...stripped.toolPolicy, preapproved: [...preapproved, ...ownTools] },
         },
       };

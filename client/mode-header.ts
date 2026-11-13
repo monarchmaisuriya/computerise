@@ -6,9 +6,11 @@ const LABEL: Record<Mode, string> = { off: "Computer off", ask: "Computer asks",
 const CHOICE: Record<Mode, string> = { off: "Off", ask: "Ask before actions", auto: "Automatic" };
 
 const title = (count: number) => (count === 1 ? "Computer-use mode for this workspace's chat" : `Computer-use mode for all ${count} chats in this workspace`);
-const label = (modes: readonly Mode[]) => (modes.every((mode) => mode === modes[0]) ? LABEL[modes[0]] : "Computer mixed");
+// The mode every chat in the workspace is in, or null while they differ.
+const sharedMode = (modes: readonly Mode[]): Mode | null => (modes.every((mode) => mode === modes[0]) ? modes[0] : null);
 
-type Shown = { registration: PluginButtonRegistration; chatIds: string[]; label: string };
+// shown is the chat count and shared mode the button was last drawn for.
+type Shown = { registration: PluginButtonRegistration; chatIds: string[]; shown: string };
 
 // Paseo gives a header button its workspace but not the chat in front, so the header sets the mode
 // of every chat in the workspace that has the computer tools. One 2-second poll keeps each
@@ -30,12 +32,15 @@ export function contributeModeHeader(client: PluginClientContext, notices: Appro
     const failed = results.filter((result) => result.status === "rejected").length;
     if (failed) throw new Error(`Could not set ${CHOICE[mode]} for ${failed} of ${chatIds.length} chats`);
   };
-  const menu = (workspaceId: string, count: number): PluginButton["behavior"] => ({
+  // Paseo focuses the first row when a menu opens, which reads like a selection, and gives plugin
+  // rows no checked state; the shared mode's row carries a check icon instead.
+  const menu = (workspaceId: string, count: number, shared: Mode | null): PluginButton["behavior"] => ({
     kind: "menu",
     items: modeSchema.options.map((mode) => ({
       kind: "item",
       id: mode,
       title: count === 1 ? CHOICE[mode] : `${CHOICE[mode]} for all ${count} chats`,
+      ...(mode === shared ? { icon: "Check" } : {}),
       behavior: { kind: "action", onPress: setAll(workspaceId, mode) },
     })),
   });
@@ -57,19 +62,25 @@ export function contributeModeHeader(client: PluginClientContext, notices: Appro
       buttons.delete(workspaceId);
     }
     for (const [workspaceId, { chatIds, modes }] of workspaces) {
-      const text = { title: title(chatIds.length), label: label(modes) };
-      const shown = buttons.get(workspaceId);
-      if (!shown) {
-        const button: PluginButton = { ...text, icon: "MonitorCog", behavior: menu(workspaceId, chatIds.length) };
-        buttons.set(workspaceId, { registration: client.addHeaderButton({ id: "computer-mode", workspaceId, button }), chatIds, label: text.label });
+      const shared = sharedMode(modes);
+      const button: PluginButton = {
+        title: title(chatIds.length),
+        label: shared === null ? "Computer mixed" : LABEL[shared],
+        icon: "MonitorCog",
+        behavior: menu(workspaceId, chatIds.length, shared),
+      };
+      const drawn = `${chatIds.length}:${shared ?? "mixed"}`;
+      const existing = buttons.get(workspaceId);
+      if (!existing) {
+        buttons.set(workspaceId, { registration: client.addHeaderButton({ id: "computer-mode", workspaceId, button }), chatIds, shown: drawn });
         continue;
       }
-      // Paseo closes an open menu on any update that carries a behavior. The menu's titles depend
-      // only on the chat count, so it is resent only when that changes.
-      if (shown.chatIds.length !== chatIds.length) shown.registration.update({ ...text, behavior: menu(workspaceId, chatIds.length) });
-      else if (shown.label !== text.label) shown.registration.update(text);
-      shown.chatIds = chatIds;
-      shown.label = text.label;
+      // Paseo closes an open menu on any update that carries a behavior. Everything the button
+      // shows follows from the chat count and the shared mode, so it is resent only when one of
+      // them changes, which happens right after a pick, when the menu has closed anyway.
+      if (existing.shown !== drawn) existing.registration.update({ title: button.title, label: button.label, behavior: button.behavior });
+      existing.chatIds = chatIds;
+      existing.shown = drawn;
     }
     notices.update(status.pending, (agentId) => chats.get(agentId)?.title ?? agentId);
   };

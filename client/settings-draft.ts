@@ -1,4 +1,4 @@
-import { bundleIdSchema } from "../shared/contracts";
+import { APPROVAL_TIMEOUT_SECONDS, bundleIdSchema } from "../shared/contracts";
 
 export function parseBundleIds(raw: string): string[] {
   const values = raw
@@ -14,10 +14,11 @@ export function parseBundleIds(raw: string): string[] {
 }
 
 export function parseTimeout(raw: string): number {
+  const { min, max } = APPROVAL_TIMEOUT_SECONDS;
   const value = raw.trim();
-  if (value === "") throw new Error("Expected approval timeout from 5 to 55 seconds, got an empty value");
+  if (value === "") throw new Error(`Expected approval timeout from ${min} to ${max} seconds, got an empty value`);
   if (!/^\d+$/.test(value)) throw new Error(`Expected a whole number for approval timeout, got ${JSON.stringify(value)}`);
   const seconds = Number(value);
-  if (seconds < 5 || seconds > 55) throw new Error(`Expected approval timeout from 5 to 55 seconds, got ${seconds}`);
+  if (seconds < min || seconds > max) throw new Error(`Expected approval timeout from ${min} to ${max} seconds, got ${seconds}`);
   return seconds;
 }

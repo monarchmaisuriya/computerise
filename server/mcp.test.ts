@@ -89,6 +89,7 @@ describe("the computer MCP endpoint", () => {
       panel,
       settings: async () => currentSettings,
       agentTitle: async (agentId) => `title of ${agentId}`,
+      waitHeartbeatMs: 20,
     });
     http = await computer.listen(0);
     port = (http.address() as AddressInfo).port;
@@ -99,11 +100,12 @@ describe("the computer MCP endpoint", () => {
     await new Promise((resolve) => http.close(resolve));
   });
 
-  async function agent(agentId: string, mode: Mode): Promise<Client> {
+  // waitSeconds is how long the agent's MCP client waits for a call, as the plugin signed it.
+  async function agent(agentId: string, mode: Mode, waitSeconds?: number): Promise<Client> {
     const seat = seats.mint();
     await seats.bind(seat, agentId);
     await control.setMode(agentId, mode);
-    return connect(`Bearer ${tokens.mint({ seat })}`);
+    return connect(`Bearer ${tokens.mint({ seat, ...(waitSeconds === undefined ? {} : { waitSeconds }) })}`);
   }
 
   async function connect(authorization: string): Promise<Client> {
@@ -736,6 +738,44 @@ describe("the computer MCP endpoint", () => {
     snapshot.release();
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(clicks()).toBe(0);
+  });
+
+  // Claude ends a call that sends nothing for 5 minutes, and the lease frees itself after 120
+  // seconds idle; a card that waits longer must keep both alive.
+  it("keeps the screen and the client's call alive while a card waits", async () => {
+    const client = await agent("agent-x", "ask", 1800);
+    await call(client, "screenshot");
+    const kept = vi.spyOn(lease, "keepAlive");
+    const progress: unknown[] = [];
+    const click = client.callTool({ name: "click", arguments: { x: 400, y: 220 } }, undefined, { onprogress: (update) => void progress.push(update) });
+    const { row } = await nextRow(1);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    approvals.answer(row.requestId, "agent-x", true);
+    expect((await click).isError).toBeFalsy();
+    expect(kept.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(kept.mock.calls.every(([agentId]) => agentId === "agent-x")).toBe(true);
+    expect(progress.length).toBeGreaterThanOrEqual(2);
+    const settled = kept.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(kept.mock.calls.length).toBe(settled);
+  });
+
+  it("caps a card's wait at what the agent's client waits: 55 seconds unless its token says longer", async () => {
+    const waits: (number | undefined)[] = [];
+    const request = approvals.request.bind(approvals);
+    approvals.request = (agentId, action, app, appScope, options) => {
+      waits.push(options?.maxWaitMs);
+      return request(agentId, action, app, appScope, options);
+    };
+    for (const [index, [agentId, waitSeconds]] of ([["agent-old", undefined], ["agent-new", 1800]] as const).entries()) {
+      const client = await agent(agentId, "ask", waitSeconds);
+      await call(client, "screenshot");
+      const click = call(client, "click", { x: 400, y: 220 });
+      approvals.answer((await nextRow(index + 1)).row.requestId, agentId, false);
+      await click;
+      lease.release(agentId);
+    }
+    expect(waits).toEqual([55_000, 1_800_000]);
   });
 
   // A combo with cmd, ctrl, or option can be another app's global shortcut (1Password's Quick

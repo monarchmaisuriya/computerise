@@ -1,7 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { CancelledNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import { CancelledNotificationSchema, type ServerNotification, type ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { Mode, Settings } from "../shared/contracts";
 import { type Approvals, type ApprovalScopes, singleApp } from "./approvals";
@@ -11,7 +12,7 @@ import { type Capture, LIMITS, type MacEngine, type MouseButton, type Point, typ
 import { canBeGlobalShortcut } from "./keys";
 import { type AppRef, blockLevel, type ControlStore, type Failsafe, type Lease, LeaseHeldError, MODE_RANK, type RateLimiter } from "./policy";
 import type { Seats } from "./seats";
-import type { TokenAuthority } from "./tokens";
+import type { TokenAuthority, TokenScope } from "./tokens";
 import type { PanelState } from "./panel-state";
 import { PLUGIN_VERSION } from "./version";
 
@@ -33,6 +34,17 @@ const NOT_READY = "Computer use is not ready for this agent yet; try again in a 
 const STOPPED = "Computer use is stopped by the user; they can resume it from the Computer panel";
 const ELEMENT_OR_POINT = "Give either element, or both x and y";
 const CLIENT_GONE = "The client stopped waiting for this action; nothing was done";
+// An agent's MCP client gives up on a call after 60 seconds unless the plugin raised that limit when
+// it created the agent (the token's waitSeconds); approval cards stop a little before.
+const UNRAISED_CLIENT_WAIT_SECONDS = 55;
+
+// Claude ends a call that sends nothing for 5 minutes, and the screen lease lapses after 120 seconds
+// idle, so a waiting approval reports progress and keeps the lease more often than either.
+const WAIT_HEARTBEAT_MS = 30_000;
+
+// What one MCP request tells the pipeline: a signal that aborts when its client stops waiting, how
+// long that client waits, and how to tell it the call is still alive.
+type CallContext = { signal?: AbortSignal; maxWaitMs: number; progress?: () => void };
 
 function auditFailed(error: unknown): void {
   console.error(`[computerise] audit write failed: ${String(error)}`);
@@ -59,6 +71,8 @@ export interface ComputerMcpOptions {
   panel?: PanelState;
   settings(): Promise<Settings>;
   agentTitle(agentId: string): Promise<string>;
+  // How often a waiting approval keeps the screen and the client's call alive; tests shorten it.
+  waitHeartbeatMs?: number;
 }
 
 export function mcpServerEntry(port: number, token: string) {
@@ -170,6 +184,18 @@ const coordinate = z.number().describe("Main-display points, as read off the scr
 const pair = z.array(coordinate).length(2).describe("[x, y] in main-display points");
 const screenshotAfter = z.boolean().optional().describe("Also return a screenshot taken just after the action");
 const elementNumber = z.number().int().min(1).max(LIMITS.snapshotElements).optional().describe("A control's number from your last ui_snapshot, instead of x and y");
+
+// Sends the client a progress notification each time it is called, when the request asked for them
+// (it carried a progress token); a client that did not ask gets nothing.
+function progressReporter(extra: RequestHandlerExtra<ServerRequest, ServerNotification>): (() => void) | undefined {
+  const progressToken = extra._meta?.progressToken;
+  if (progressToken === undefined) return undefined;
+  let progress = 0;
+  return () => {
+    progress += 1;
+    extra.sendNotification({ method: "notifications/progress", params: { progressToken, progress, message: "Waiting for the user to approve" } }).catch((error: unknown) => console.error(`[computerise] could not report progress: ${String(error)}`));
+  };
+}
 
 function runningKey(seat: string, requestId: string | number): string {
   return `${seat}\n${typeof requestId}:${String(requestId)}`;
@@ -342,8 +368,8 @@ export class ComputerMcp {
     return { content: result.content, target: front?.bundleId ?? null };
   }
 
-  // turn is the lease turn the action was planned in; signal aborts when the client stops waiting.
-  private async act<A>(agentId: string, mode: Mode, spec: ActionSpec<A>, args: A, settings: Settings, turn: number, signal: AbortSignal | undefined) {
+  // turn is the lease turn the action was planned in.
+  private async act<A>(agentId: string, mode: Mode, spec: ActionSpec<A>, args: A, settings: Settings, turn: number, { signal, maxWaitMs, progress }: CallContext) {
     const { approvals, scopes } = this.options;
     const working = this.options.lease.workingApp(agentId);
     if (spec.needsWorkingApp && working === null) throw new Refusal("Take a screenshot first, so the plugin knows which app you are working in");
@@ -355,7 +381,16 @@ export class ComputerMcp {
       // Planning awaited, so the turn may have ended; a card shown now would outlive it.
       this.requireTurn(agentId, turn);
       const scopeApp = spec.scopable ? singleApp(planned.apps) : null;
-      const decision = await approvals.request(agentId, description, [...new Set(planned.apps.map((app) => app.name))].join(", "), scopeApp?.name ?? null, signal);
+      const alive = setInterval(() => {
+        this.options.lease.keepAlive(agentId, turn);
+        progress?.();
+      }, this.options.waitHeartbeatMs ?? WAIT_HEARTBEAT_MS);
+      let decision: Awaited<ReturnType<Approvals["request"]>>;
+      try {
+        decision = await approvals.request(agentId, description, [...new Set(planned.apps.map((app) => app.name))].join(", "), scopeApp?.name ?? null, { signal, maxWaitMs });
+      } finally {
+        clearInterval(alive);
+      }
       if (decision === "deny") throw new Refusal("The user denied this action");
       if (decision === "timeout") throw new Refusal("The user did not answer in time; nothing was done");
       if (decision === "cancelled") throw new Refusal("The request was withdrawn before it was answered (Stop, a mode change, the end of the agent's turn, or the client stopped waiting); nothing was done");
@@ -428,7 +463,7 @@ export class ComputerMcp {
   // afterAction marks the reads that report an action's own result: they keep the agent's own
   // pointer placement excused (Failsafe.tripped), never change the working app (read), and never take
   // the screen back for an agent that let go of it during the action (turn end, close).
-  private async onScreen<A>(agentId: string, mode: Mode, spec: ReadSpec<A> | ActionSpec<A>, args: A, afterAction = false, signal?: AbortSignal): Promise<{ content: Content[]; target: string | null; observed?: Observed }> {
+  private async onScreen<A>(agentId: string, mode: Mode, spec: ReadSpec<A> | ActionSpec<A>, args: A, afterAction = false, context: CallContext = { maxWaitMs: UNRAISED_CLIENT_WAIT_SECONDS * 1_000 }): Promise<{ content: Content[]; target: string | null; observed?: Observed }> {
     const { engine, failsafe, lease } = this.options;
     let turn = 0;
     const status = await engine.status();
@@ -449,7 +484,7 @@ export class ComputerMcp {
     const settings = await this.options.settings();
     if (spec.kind === "read") return this.read(agentId, spec, args, status, settings, afterAction);
     if (afterAction) throw new Error("An action cannot run as the read after an action");
-    return this.act(agentId, mode, spec, args, settings, turn, signal);
+    return this.act(agentId, mode, spec, args, settings, turn, context);
   }
 
   private async statusReport(agentId: string): Promise<string> {
@@ -479,7 +514,7 @@ export class ComputerMcp {
   // Every tool runs through here, in this order: identity, stop, mode, rate limit, then (for tools
   // that touch the screen) corner failsafe, lease, and the read or action path. status skips only the
   // stop and mode checks (InfoSpec). Argument schemas are checked by the MCP server before.
-  private async call<A>(seat: string, tool: string, spec: ToolSpec<A>, args: A, signal?: AbortSignal) {
+  private async call<A>(seat: string, tool: string, spec: ToolSpec<A>, args: A, context: CallContext) {
     const { seats, calls, rates, audit } = this.options;
     let agentId: string | null = null;
     let target: string | null = null;
@@ -491,7 +526,7 @@ export class ComputerMcp {
       calls.take(agentId);
       if (spec.kind === "action") rates.take(agentId);
       const result =
-        spec.kind === "pause" ? { content: await spec.run(args), target: null } : spec.kind === "info" ? { content: await spec.run(agentId), target: null } : await this.onScreen(agentId, mode, spec, args, false, signal);
+        spec.kind === "pause" ? { content: await spec.run(args), target: null } : spec.kind === "info" ? { content: await spec.run(agentId), target: null } : await this.onScreen(agentId, mode, spec, args, false, context);
       target = result.target;
       // The tool already ran, so a failed audit write must not tell the agent it failed (it would retry).
       await audit.record({ agentId, tool, target, outcome: "ok", chars }).catch(auditFailed);
@@ -511,12 +546,12 @@ export class ComputerMcp {
     }
   }
 
-  private buildServer(seat: string): McpServer {
+  private buildServer({ seat, waitSeconds = UNRAISED_CLIENT_WAIT_SECONDS }: TokenScope): McpServer {
     const { engine, lease, failsafe } = this.options;
     const mcp = new McpServer({ name: SERVER_NAME, version: PLUGIN_VERSION });
     // Annotations are hints for clients; the pipeline above is what enforces the rules.
     const register = <A>(name: (typeof TOOL_NAMES)[number], title: string, description: string, inputSchema: z.ZodRawShape, spec: ToolSpec<A>) => {
-      mcp.registerTool(name, { title, description, inputSchema, annotations: { readOnlyHint: spec.kind !== "action" } }, async (args: unknown, extra: { signal: AbortSignal; requestId: string | number }) => {
+      mcp.registerTool(name, { title, description, inputSchema, annotations: { readOnlyHint: spec.kind !== "action" } }, async (args: unknown, extra: RequestHandlerExtra<ServerRequest, ServerNotification>) => {
         const key = runningKey(seat, extra.requestId);
         const cancel = new AbortController();
         const closed = () => cancel.abort();
@@ -524,7 +559,7 @@ export class ComputerMcp {
         else extra.signal.addEventListener("abort", closed, { once: true });
         this.running.set(key, cancel);
         try {
-          return await this.call(seat, name, spec, args as A, cancel.signal);
+          return await this.call(seat, name, spec, args as A, { signal: cancel.signal, maxWaitMs: waitSeconds * 1_000, progress: progressReporter(extra) });
         } finally {
           extra.signal.removeEventListener("abort", closed);
           if (this.running.get(key) === cancel) this.running.delete(key);
@@ -809,7 +844,7 @@ export class ComputerMcp {
       res.writeHead(400).end("Expected a JSON-RPC request body");
       return;
     }
-    const mcp = this.buildServer(scope.seat);
+    const mcp = this.buildServer(scope);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
       void transport.close();

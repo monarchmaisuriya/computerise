@@ -3,6 +3,8 @@ import { z } from "zod";
 
 export const modeSchema = z.enum(["off", "ask", "auto"]);
 export type Mode = z.infer<typeof modeSchema>;
+export const availabilitySchema = z.object({ state: z.enum(["prepared", "available", "unavailable", "saved", "saved-error"]), detail: z.string() });
+export type Availability = z.infer<typeof availabilitySchema>;
 
 // How long an approval card waits for the user. A card also never waits longer than the agent's own
 // MCP client waits for the call; see the token's waitSeconds.
@@ -39,12 +41,12 @@ export const setModeRpc = defineRpc({
   output: z.object({ mode: modeSchema }),
 });
 
-// modes holds the mode the server enforces for every agent that has the computer tools; an agent
-// missing from it has none.
+// Retained modes are independent from tool delivery on the current open. Missing availability
+// means no current opening has reported delivery; it is not proof that a retained seat is usable.
 export const statusRpc = defineRpc({
   name: "computer.status",
   input: z.object({}),
-  output: z.object({ stopped: z.boolean(), modes: z.record(z.string(), modeSchema), holder: z.string().nullable() }),
+  output: z.object({ stopped: z.boolean(), modes: z.record(z.string(), modeSchema), availability: z.record(z.string(), availabilitySchema), holder: z.string().nullable() }),
 });
 
 export const activitySchema = z.object({
@@ -126,6 +128,7 @@ export const panelStatusRpc = defineRpc({
   output: z.object({
     stopped: z.boolean(),
     modes: z.record(z.string(), modeSchema),
+    availability: z.record(z.string(), availabilitySchema),
     holder: z.string().nullable(),
     pending: z.array(approvalRowSchema.extend({ agentId: z.string() })),
     screenshot: screenshotInfoSchema.nullable(),

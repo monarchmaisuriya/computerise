@@ -1,9 +1,10 @@
 import type { Server } from "node:http";
+import { isDeepStrictEqual } from "node:util";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { z } from "zod";
-import { answerApprovalRpc, APPROVAL_ROW_KIND, APPROVAL_TIMEOUT_SECONDS, computerSettings, type healthSchema, panelHealthRpc, panelScreenshotRpc, panelStatusRpc, permissionActionRpc, type Settings, setModeRpc, setStopRpc, statusRpc } from "../shared/contracts";
+import { answerApprovalRpc, APPROVAL_ROW_KIND, APPROVAL_TIMEOUT_SECONDS, type Availability, computerSettings, type healthSchema, panelHealthRpc, panelScreenshotRpc, panelStatusRpc, permissionActionRpc, type Settings, setModeRpc, setStopRpc, statusRpc } from "../shared/contracts";
 import { Approvals, ApprovalScopes } from "./approvals";
 import { AuditLog } from "./audit";
 import { ElementTables } from "./elements";
@@ -27,10 +28,13 @@ const LEASE_IDLE_MS = 120_000;
 // no per-server timeout, so Codex chats keep the 60-second limit.
 const CLAUDE_TOOL_TIMEOUT_MS = (APPROVAL_TIMEOUT_SECONDS.max + 60) * 1_000;
 
-function clientWait(provider: string, env: Record<string, string>): { env: Record<string, string>; waitSeconds?: number } {
-  if (provider !== "claude") return { env: {} };
-  const timeout = Math.max(Number(env.MCP_TOOL_TIMEOUT) || 0, CLAUDE_TOOL_TIMEOUT_MS);
-  return { env: { MCP_TOOL_TIMEOUT: String(timeout) }, waitSeconds: APPROVAL_TIMEOUT_SECONDS.max };
+function clientWait(claude: boolean, env: Record<string, string>): { env: Record<string, string>; waitSeconds?: number } {
+  if (!claude) return { env: {} };
+  if (Object.hasOwn(env, "MCP_TOOL_TIMEOUT")) {
+    const timeout = Number(env.MCP_TOOL_TIMEOUT);
+    return Number.isFinite(timeout) && timeout >= CLAUDE_TOOL_TIMEOUT_MS ? { env: {}, waitSeconds: APPROVAL_TIMEOUT_SECONDS.max } : { env: {} };
+  }
+  return { env: { MCP_TOOL_TIMEOUT: String(CLAUDE_TOOL_TIMEOUT_MS) }, waitSeconds: APPROVAL_TIMEOUT_SECONDS.max };
 }
 const ACTIONS_PER_MINUTE = 60;
 const CALLS_PER_MINUTE = 120;
@@ -38,9 +42,6 @@ const MINUTE_MS = 60_000;
 // Where Paseo records a child agent's parent (getParentAgentIdFromLabels in @getpaseo/protocol,
 // which plugin code cannot import at runtime).
 const PARENT_AGENT_LABEL = "paseo.parent-agent-id";
-
-// Paseo 0.14 passes the new agent's labels to session_open; the 0.13 SDK types do not declare them.
-type SessionOpenLabels = { labels?: Record<string, string> };
 
 const PROMPT_SECTION = [
   PROMPT_SECTION_START,
@@ -52,16 +53,6 @@ const PROMPT_SECTION = [
   "- For web pages in Paseo's browser, prefer the browser_* tools.",
   PROMPT_SECTION_END,
 ].join("\n");
-
-const SECTION_PATTERN = new RegExp(`\\s*${PROMPT_SECTION_START}[\\s\\S]*?${PROMPT_SECTION_END}`, "g");
-
-function withoutSection(prompt: string | undefined): string | undefined {
-  return prompt?.replace(SECTION_PATTERN, "");
-}
-
-function withSection(prompt: string | undefined): string {
-  return prompt ? `${prompt}\n\n${PROMPT_SECTION}` : PROMPT_SECTION;
-}
 
 interface Runtime {
   computer: ComputerMcp;
@@ -80,6 +71,7 @@ interface Runtime {
   host: ScriptHost<ScriptName> | null;
   // The address agents are given; null when the tool server could not listen.
   port: number | null;
+  configuredPort: number;
   http: Server | null;
 }
 
@@ -90,6 +82,17 @@ export interface ComputerOptions {
 }
 
 export function contributeComputer(server: PluginServerContext, options: ComputerOptions) {
+  if (!server.features?.adaptiveAgentFeatures) throw new Error("Computerise requires adaptive agent features; update Paseo before loading this source version");
+  server.registerLegacyAgentConfig({
+    version: 1,
+    selectors: [
+      { id: "computer-endpoint", group: "computer", label: "Saved computer tools", kind: "mcp", name: SERVER_NAME },
+      { id: "computer-instructions", group: "computer", label: "Saved computer instructions", kind: "prompt-section", start: PROMPT_SECTION_START, end: PROMPT_SECTION_END },
+      ...TOOL_NAMES.map((tool) => ({ id: `computer-grant-${tool}`, group: "computer", label: `Saved computer ${tool} approval`, kind: "grant" as const, server: SERVER_NAME, tool })),
+      { id: "computer-seat-env", group: "computer", label: "Saved computer seat environment", kind: "env", key: SEAT_ENV, baselines: [{ id: "absent", label: "Remove the saved seat environment from launch", kind: "absent" }] },
+      { id: "computer-timeout-env", group: "computer", label: "Saved MCP timeout (previous caller value cannot be recovered)", kind: "env", key: "MCP_TOOL_TIMEOUT", baselines: [{ id: "absent", label: "Inherit the current client timeout default", kind: "absent" }] },
+    ],
+  });
   const platform = options.platform ?? process.platform;
   const settings = server.registerSettings(computerSettings);
 
@@ -109,7 +112,7 @@ export function contributeComputer(server: PluginServerContext, options: Compute
   }
 
   // MCP calls arrive outside any hook, so the plugin keeps the latest Paseo handle a hook or RPC
-  // gave it. Every agent passes through a hook (create, or session_open on resume) before it can call.
+  // gave it. Every adaptive agent passes through the open hook before it can call.
   let paseo: PaseoApi | null = null;
   const remember = (api: PaseoApi) => {
     paseo = api;
@@ -172,11 +175,11 @@ export function contributeComputer(server: PluginServerContext, options: Compute
       const http = await computer.listen(mcpPort);
       const port = (http.address() as AddressInfo).port;
       console.log(`[computerise] data ${root}; tools on 127.0.0.1:${port}`);
-      return { ...base, port, http };
+      return { ...base, port, http, configuredPort: mcpPort };
     } catch (error) {
       // Agents keep their stored address, so the plugin never moves to another port by itself.
       console.error(`[computerise] the tool server could not listen on 127.0.0.1:${mcpPort} (${String(error)}); change the port in the plugin settings and reload it. New agents get no computer tools until then.`);
-      return { ...base, port: null, http: null };
+      return { ...base, port: null, http: null, configuredPort: mcpPort };
     }
   }
 
@@ -189,78 +192,139 @@ export function contributeComputer(server: PluginServerContext, options: Compute
     return runtime;
   }
 
-  // Always drop what a parent agent passed down, so a child never acts with its parent's seat.
-  server.before("agent.create", async ({ request }, { paseo: api }) => {
+  const openings = new Map<string, Map<string, { availability: Availability; installed: boolean }>>();
+  const activeLaunches = new Map<string, string>();
+  const contributionEnvs = new Map<string, Record<string, string>>();
+  const availability = () => Object.fromEntries([...openings].flatMap(([agentId, attempts]) => {
+    const active = activeLaunches.get(agentId);
+    const latest = active ? attempts.get(active) : [...attempts.values()].filter((attempt) => !attempt.installed).at(-1);
+    return latest ? [[agentId, latest.availability]] : [];
+  }));
+
+  server.addHook("agent.open.before", async ({ request }, { paseo: api, launch, signal }) => {
     remember(api);
-    const { config } = request;
-    const mcpServers = Object.fromEntries(Object.entries(config.mcpServers ?? {}).filter(([name]) => name !== SERVER_NAME));
-    const preapproved = (config.toolPolicy?.preapproved ?? []).filter((ref) => ref.server !== SERVER_NAME);
-    const env = Object.fromEntries(Object.entries(request.env ?? {}).filter(([name]) => name !== SEAT_ENV));
-    const stripped = { ...config, systemPrompt: withoutSection(config.systemPrompt), mcpServers, toolPolicy: { ...config.toolPolicy, preapproved } };
-    if (!runtime) return { ...request, env, config: stripped };
-    // Computer use is an addition to an agent; failing to prepare it must not block the agent.
-    try {
-      const { tokens, seats, port } = await runtime;
-      if (port === null) return { ...request, env, config: stripped };
-      const seat = seats.mint();
-      const ownTools = TOOL_NAMES.map((tool) => ({ kind: "mcp" as const, server: SERVER_NAME, tool }));
-      const wait = clientWait(config.provider, env);
-      return {
-        ...request,
-        env: { ...env, ...wait.env, [SEAT_ENV]: seat },
-        config: {
-          ...stripped,
-          systemPrompt: withSection(stripped.systemPrompt),
-          mcpServers: { ...mcpServers, ...mcpServerEntry(port, tokens.mint({ seat, ...(wait.waitSeconds === undefined ? {} : { waitSeconds: wait.waitSeconds }) })) },
-          toolPolicy: { ...stripped.toolPolicy, preapproved: [...preapproved, ...ownTools] },
-        },
-      };
-    } catch (error) {
-      console.error(`[computerise] could not give computer tools to a ${config.provider} agent in ${config.cwd}: ${String(error)}`);
-      return { ...request, env, config: stripped };
+    if (request.purpose === "history") return;
+    const support = request.openSupport;
+    const base = request.baseConfig;
+    if (!support || !base) throw new Error("Computerise expected the host's adaptive open support and required base configuration");
+    const occupied = Object.hasOwn(base.mcpServers ?? {}, SERVER_NAME);
+    const attempts = openings.get(request.agentId) ?? new Map<string, { availability: Availability; installed: boolean }>();
+    let retainSeat: (() => void) | undefined;
+    openings.set(request.agentId, attempts);
+    const report = (state: Availability["state"], detail: string) => {
+      attempts.set(launch.id, { availability: { state, detail }, installed: false });
+      console.log(`[computerise] agent ${request.agentId} computer ${state}: ${detail}`);
+    };
+    launch.onDispose(() => {
+      attempts.delete(launch.id);
+      contributionEnvs.delete(launch.id);
+      if (activeLaunches.get(request.agentId) === launch.id) activeLaunches.delete(request.agentId);
+      if (attempts.size === 0 && openings.get(request.agentId) === attempts) openings.delete(request.agentId);
+    });
+    launch.onInstalled(() => {
+      retainSeat?.();
+      const attempt = attempts.get(launch.id);
+      if (!attempt) throw new Error("Computerise availability disappeared before installation");
+      attempt.installed = true;
+      if (attempt.availability.state === "prepared") attempt.availability = { state: "available", detail: attempt.availability.detail.replace("Computer tools prepared for this open; host admission is not confirmed here.", "Computer tools are available for this session.") };
+      activeLaunches.set(request.agentId, launch.id);
+      console.log(`[computerise] agent ${request.agentId} computer installed: ${attempt.availability.state}`);
+    });
+    if (!runtime) {
+      report("unavailable", "Computer tools require a macOS host. Mode controls remain available on macOS.");
+      return;
     }
+    const { seats, control, tokens, port, configuredPort } = await runtime;
+    signal.throwIfAborted();
+    launch.signal.throwIfAborted();
+    const parentId = request.labels[PARENT_AGENT_LABEL]?.trim();
+    if (request.reason === "create" && !Object.hasOwn(control.modes(), request.agentId) && parentId && control.mode(parentId) === "off") {
+      await control.setMode(request.agentId, "off");
+    }
+    const promptState = request.legacyConfigState?.selectors["computer-instructions"];
+    const savedPrompt = promptState === "present" || promptState === "ambiguous" || Boolean(base.systemPrompt?.includes(PROMPT_SECTION_START) || base.systemPrompt?.includes(PROMPT_SECTION_END));
+    const instruction = support.instructions === "supported" && !savedPrompt;
+    const exact = support.exactMcpPreapproval === "supported";
+    const claude = support.adapter.kind === "builtin" && support.adapter.id === "claude";
+    const prior = request.previousContribution;
+    const previousEnv = prior && contributionEnvs.get(prior.launchId);
+    const ownedMcp = Object.hasOwn(prior?.mcpServers ?? {}, SERVER_NAME);
+    const ownedEnv = Boolean(previousEnv && Object.keys(previousEnv).length);
+    const fixed = (support.restrictions.mcpConfiguration === "fixed" && ownedMcp) || (support.restrictions.processEnvironment === "fixed" && ownedEnv);
+    if (fixed && (!occupied || ownedMcp)) {
+      const guidance = "Computerise's retained contribution no longer matches this open; fully close this agent and its retained children, then reopen it";
+      if (occupied || !prior || !previousEnv || control.mode(request.agentId) === "off" || support.mcpHttp !== "supported" || port === null) throw new Error(guidance);
+      const current = await settings.read();
+      const entry = prior.mcpServers[SERVER_NAME];
+      const scope = entry?.type === "http" ? tokens.verify(entry.headers?.Authorization) : null;
+      const expectedPrompt = instruction ? [PROMPT_SECTION] : [];
+      const expectedPolicy = exact ? { preapproved: TOOL_NAMES.map((tool) => ({ kind: "mcp" as const, server: SERVER_NAME, tool })) } : undefined;
+      if (current.status !== "ready" || current.values.mcpPort !== configuredPort || entry?.type !== "http" || entry.url !== `http://127.0.0.1:${port}/mcp` || !scope || seats.agentFor(scope.seat) !== request.agentId
+        || !isDeepStrictEqual(prior.appendSystemPrompt ?? [], expectedPrompt) || !isDeepStrictEqual(prior.toolPolicy, expectedPolicy) || prior.providerOptions !== undefined
+        || !isDeepStrictEqual(prior.env, previousEnv) || Object.keys(prior.mcpServers).length !== 1) throw new Error(guidance);
+      // Equal caller values are not plugin-owned. Preserve that distinction across fixed opens.
+      const ownEnv = { ...previousEnv };
+      if (Object.keys(ownEnv).length && support.restrictions.processEnvironment !== "fixed" && support.restrictions.processEnvironment !== "mutable") throw new Error(guidance);
+      for (const key of Object.keys(ownEnv)) {
+        if (prior.env[key] !== ownEnv[key] || (Object.hasOwn(request.env, key) && request.env[key] !== ownEnv[key])) throw new Error(guidance);
+        if (key === SEAT_ENV && ownEnv[key] !== scope.seat) throw new Error(guidance);
+        if (key === "MCP_TOOL_TIMEOUT" && !claude) throw new Error(guidance);
+      }
+      const timeout = ownEnv.MCP_TOOL_TIMEOUT ?? request.env.MCP_TOOL_TIMEOUT;
+      if (scope.waitSeconds !== undefined && (!claude || !timeout || !Number.isFinite(Number(timeout)) || Number(timeout) < (scope.waitSeconds + 60) * 1_000)) throw new Error(guidance);
+      const retained = launch.retainPrevious();
+      contributionEnvs.set(launch.id, Object.fromEntries(Object.entries(ownEnv).filter(([key, value]) => request.env[key] !== value)));
+      retainSeat = () => seats.retain(scope.seat, request.agentId);
+      report("prepared", "Computer tools prepared for this open; host admission is not confirmed here. Reusing the retained computer binding.");
+      return { ...request, env: { ...request.env, ...ownEnv }, mcpServers: { ...request.mcpServers, ...retained.mcpServers },
+        ...(retained.appendSystemPrompt ? { appendSystemPrompt: [...(request.appendSystemPrompt ?? []), ...retained.appendSystemPrompt] } : {}),
+        ...(retained.toolPolicy ? { toolPolicy: retained.toolPolicy } : {}), ...(retained.providerOptions ? { providerOptions: retained.providerOptions } : {}) };
+    }
+    if (occupied) {
+      const saved = base.mcpServers?.[SERVER_NAME];
+      const scope = saved?.type === "http" ? tokens.verify(saved.headers?.Authorization) : null;
+      const own = saved?.type === "http" && port !== null && saved.url === `http://127.0.0.1:${port}/mcp` && scope !== null && seats.agentFor(scope.seat) === request.agentId;
+      report(own ? "saved" : "saved-error", own
+        ? "Using saved configuration, not yet fully adaptive. Off and Stop still apply."
+        : "Saved computer endpoint is unverified or its credential is invalid for this agent. It is unchanged; review or explicitly adopt the saved configuration.");
+      return;
+    }
+    if (control.mode(request.agentId) === "off") {
+      report("unavailable", "Computer use is Off. The retained mode is unchanged; tools can return on an eligible open after you change it.");
+      return;
+    }
+    if (support.mcpHttp !== "supported" || support.restrictions.mcpConfiguration !== "mutable" || port === null) {
+      report("unavailable", port === null ? "The computer tool server could not listen. Fix its port and reload the plugin." : `HTTP computer tools are ${support.mcpHttp}; MCP configuration is ${support.restrictions.mcpConfiguration}. Mode and Stop are retained.`);
+      return;
+    }
+    signal.throwIfAborted();
+    launch.signal.throwIfAborted();
+    launch.onDispose(async ({ installed }) => {
+      const allocation = await allocationPromise;
+      await seats.releaseOpening(allocation.seat, request.agentId, installed);
+    });
+    const allocationPromise = seats.ensure(request.agentId).then((allocation) => {
+      seats.holdOpening(allocation.seat, request.agentId);
+      return allocation;
+    });
+    const allocation = await allocationPromise;
+    retainSeat = () => seats.retain(allocation.seat, request.agentId);
+    signal.throwIfAborted();
+    launch.signal.throwIfAborted();
+    const wait = clientWait(claude && support.restrictions.processEnvironment === "mutable", request.env);
+    const ownEnv = { ...wait.env, ...(support.restrictions.processEnvironment === "mutable" && !Object.hasOwn(request.env, SEAT_ENV) ? { [SEAT_ENV]: allocation.seat } : {}) };
+    contributionEnvs.set(launch.id, ownEnv);
+    report("prepared", `Computer tools prepared for this open; host admission is not confirmed here.${exact ? " Exact tool approvals supplied." : " Ordinary provider permission prompts remain."}${savedPrompt ? " Saved instructions remain unchanged and need separate adoption." : !instruction ? " Instruction delivery is unavailable." : ""}`);
+    return {
+      ...request,
+      env: { ...request.env, ...ownEnv },
+      mcpServers: { ...request.mcpServers, ...mcpServerEntry(port, tokens.mint({ seat: allocation.seat, ...(wait.waitSeconds === undefined ? {} : { waitSeconds: wait.waitSeconds }) })) },
+      ...(instruction ? { appendSystemPrompt: [...(request.appendSystemPrompt ?? []), PROMPT_SECTION] } : {}),
+      ...(exact ? { toolPolicy: { preapproved: [...(request.toolPolicy?.preapproved ?? []), ...TOOL_NAMES.map((tool) => ({ kind: "mcp" as const, server: SERVER_NAME, tool }))] } } : {}),
+    };
   });
 
-  // Unsaved agents start in ask mode, so a child of an Off agent would otherwise see more than its
-  // parent. The agent is not registered yet during session_open, so its parent comes from the
-  // labels in the request; without them, the agent starts Off.
-  function startsOff(control: ControlStore, agentId: string, { labels }: SessionOpenLabels): boolean {
-    if (!labels) {
-      console.error(`[computerise] Paseo did not pass the labels of agent ${agentId}, so its parent is unknown; it starts with computer use off`);
-      return true;
-    }
-    const parentId = labels[PARENT_AGENT_LABEL]?.trim();
-    return Boolean(parentId) && control.mode(parentId) === "off";
-  }
-
-  // The seat set at creation reaches session_open only when reason is "create" (checked in the spike).
-  // The mode is saved before the seat is bound, so the agent's first call already sees it.
-  server.before("agent.session_open", async ({ request }, { paseo: api }) => {
-    remember(api);
-    const seat = request.env[SEAT_ENV];
-    if (!runtime || request.reason !== "create" || !seat) return;
-    const { seats, control } = await runtime;
-    try {
-      if (startsOff(control, request.agentId, request as SessionOpenLabels)) await control.setMode(request.agentId, "off");
-      await seats.bind(seat, request.agentId);
-    } catch (error) {
-      console.error(`[computerise] seat for agent ${request.agentId} was not bound (${String(error)}); its computer tools answer "not ready"`);
-    }
-  });
-
-  const effectiveModes = (seats: Seats, control: ControlStore) => Object.fromEntries(seats.agents().map((agentId) => [agentId, control.mode(agentId)]));
-
-  // The plugin asks the user itself in ask mode, so the CLI's own prompt for these tools would ask
-  // twice. Claude names the tool mcp__<server>__<tool>; Codex names only the server. Claude names
-  // are matched in full: a server called paseo-computerise__x shares the prefix.
-  const claudeToolNames = new Set<string>(TOOL_NAMES.map((tool) => `mcp__${SERVER_NAME}__${tool}`));
-  server.on("agent.permission_requested", async ({ agent, request }, { paseo: api }) => {
-    remember(api);
-    if (!runtime) return;
-    const ours = claudeToolNames.has(request.name) || (request.name === "CodexMcpElicitation" && request.metadata?.serverName === SERVER_NAME);
-    if (!ours) return;
-    await api.agents.ref(agent.id).respondToPermission({ requestId: request.id, response: { behavior: "allow" } });
-  });
+  const effectiveModes = (seats: Seats, control: ControlStore) => Object.fromEntries([...new Set([...seats.agents(), ...Object.keys(control.modes()), ...openings.keys()])].map((agentId) => [agentId, control.mode(agentId)]));
 
   const releaseLease = async ({ agent }: { agent: { id: string } }, { paseo: api }: { paseo: PaseoApi }) => {
     remember(api);
@@ -270,14 +334,14 @@ export function contributeComputer(server: PluginServerContext, options: Compute
     lease.release(agent.id);
     scopes.clear(agent.id);
   };
-  server.on("agent.turn_ended", releaseLease);
+  server.addHook("agent.turn.after", releaseLease);
   // Element numbers outlive a turn, because every element action re-checks its control; they do
   // not outlive the agent.
-  server.on("agent.closed", async (event, context) => {
+  server.addHook("agent.close.after", async (event, context) => {
     await releaseLease(event, context);
     if (runtime) (await runtime).elements.clear(event.agent.id);
   });
-  server.on("agent.archived", async ({ agent }, { paseo: api }) => {
+  server.addHook("agent.archive.after", async ({ agent }, { paseo: api }) => {
     remember(api);
     if (!runtime) return;
     const { lease, calls, rates, seats, control, scopes, elements, approvals } = await runtime;
@@ -289,6 +353,8 @@ export function contributeComputer(server: PluginServerContext, options: Compute
     rates.release(agent.id);
     await seats.revokeAgent(agent.id);
     await control.removeAgent(agent.id);
+    openings.delete(agent.id);
+    activeLaunches.delete(agent.id);
   });
 
   server.handle(setModeRpc, async ({ agentId, mode }, { paseo: api }) => {
@@ -301,7 +367,7 @@ export function contributeComputer(server: PluginServerContext, options: Compute
   server.handle(statusRpc, async (_input, { paseo: api }) => {
     remember(api);
     const { control, lease, seats } = await requireRuntime();
-    return { stopped: control.stopped(), modes: effectiveModes(seats, control), holder: lease.holderId() };
+    return { stopped: control.stopped(), modes: effectiveModes(seats, control), availability: availability(), holder: lease.holderId() };
   });
 
   // Reads status outside the tool pipeline: it changes nothing and lets the panel show why tools fail.
@@ -317,7 +383,7 @@ export function contributeComputer(server: PluginServerContext, options: Compute
   server.handle(panelStatusRpc, async (_input, { paseo: api }) => {
     remember(api);
     const { control, lease, approvals, panel, seats } = await requireRuntime();
-    return { stopped: control.stopped(), modes: effectiveModes(seats, control), holder: lease.holderId(), pending: approvals.listPending(), ...panel.snapshot() };
+    return { stopped: control.stopped(), modes: effectiveModes(seats, control), availability: availability(), holder: lease.holderId(), pending: approvals.listPending(), ...panel.snapshot() };
   });
 
   server.handle(panelHealthRpc, async (_input, { paseo: api }) => {

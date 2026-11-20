@@ -13,7 +13,7 @@ const sharedMode = (modes: readonly Mode[]): Mode | null => (modes.every((mode) 
 type Shown = { registration: PluginButtonRegistration; chatIds: string[]; shown: string };
 
 // Paseo gives a header button its workspace but not the chat in front, so the header sets the mode
-// of every chat in the workspace that has the computer tools. One 2-second poll keeps each
+// of every chat in the workspace with a retained mode, even when tools are unavailable. One poll keeps each
 // workspace's button current and raises a notice for each approval waiting on the user.
 export function contributeModeHeader(client: PluginClientContext, notices: ApprovalNotices) {
   const buttons = new Map<string, Shown>();
@@ -48,12 +48,15 @@ export function contributeModeHeader(client: PluginClientContext, notices: Appro
   const refresh = async () => {
     if (disposed) return;
     const status = await client.rpc(panelStatusRpc, {});
-    const workspaces = new Map<string, { chatIds: string[]; modes: Mode[] }>();
+    const workspaces = new Map<string, { chatIds: string[]; modes: Mode[]; available: number; reported: number }>();
     for (const chat of chats.values()) {
       if (!Object.hasOwn(status.modes, chat.id)) continue;
-      const group = workspaces.get(chat.workspaceId) ?? { chatIds: [], modes: [] };
+      const group = workspaces.get(chat.workspaceId) ?? { chatIds: [], modes: [], available: 0, reported: 0 };
       group.chatIds.push(chat.id);
       group.modes.push(status.modes[chat.id]);
+      const state = status.availability[chat.id]?.state;
+      if (state) group.reported += 1;
+      if (state === "available" || state === "saved") group.available += 1;
       workspaces.set(chat.workspaceId, group);
     }
     for (const [workspaceId, shown] of buttons) {
@@ -61,15 +64,17 @@ export function contributeModeHeader(client: PluginClientContext, notices: Appro
       shown.registration.remove();
       buttons.delete(workspaceId);
     }
-    for (const [workspaceId, { chatIds, modes }] of workspaces) {
+    for (const [workspaceId, { chatIds, modes, available, reported }] of workspaces) {
       const shared = sharedMode(modes);
+      const limited = reported > 0 && available < chatIds.length;
+      const modeTitle = shared === null ? "Mixed" : CHOICE[shared];
       const button: PluginButton = {
-        title: title(chatIds.length),
-        label: shared === null ? "Computer mixed" : LABEL[shared],
+        title: limited ? `${available} of ${chatIds.length} chats have computer tools. Mode: ${modeTitle}. ${title(chatIds.length)}` : title(chatIds.length),
+        label: limited ? available === 0 ? "Computer unavailable" : "Computer limited" : shared === null ? "Computer mixed" : LABEL[shared],
         icon: "MonitorCog",
         behavior: menu(workspaceId, chatIds.length, shared),
       };
-      const drawn = `${chatIds.length}:${shared ?? "mixed"}`;
+      const drawn = `${chatIds.length}:${shared ?? "mixed"}:${limited ? available : "all"}`;
       const existing = buttons.get(workspaceId);
       if (!existing) {
         buttons.set(workspaceId, { registration: client.addHeaderButton({ id: "computer-mode", workspaceId, button }), chatIds, shown: drawn });
@@ -78,7 +83,10 @@ export function contributeModeHeader(client: PluginClientContext, notices: Appro
       // Paseo closes an open menu on any update that carries a behavior. Everything the button
       // shows follows from the chat count and the shared mode, so it is resent only when one of
       // them changes, which happens right after a pick, when the menu has closed anyway.
-      if (existing.shown !== drawn) existing.registration.update({ title: button.title, label: button.label, behavior: button.behavior });
+      if (existing.shown !== drawn) {
+        const modeChanged = existing.shown.split(":").slice(0, 2).join(":") !== drawn.split(":").slice(0, 2).join(":");
+        existing.registration.update({ title: button.title, label: button.label, ...(modeChanged ? { behavior: button.behavior } : {}) });
+      }
       existing.chatIds = chatIds;
       existing.shown = drawn;
     }

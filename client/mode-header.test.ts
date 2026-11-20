@@ -1,6 +1,6 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { type Mode, panelStatusRpc } from "../shared/contracts";
+import { type Availability, type Mode, panelStatusRpc } from "../shared/contracts";
 import { ApprovalNotices } from "./approval-notices";
 import { contributeModeHeader } from "./mode-header";
 
@@ -13,11 +13,11 @@ type Header = { workspaceId: string; button: Record<string, unknown>; updates: R
 // It has no addComposerPill, so a composer pill would fail the test.
 function fakeClient(modes: Record<string, Mode>) {
   const headers: Header[] = [];
-  const state = { failing: false, failSet: new Set<string>(), observer: null as Observer | null, listOptions: null as unknown, pending: [] as { requestId: string; agentId: string; action: string }[] };
+  const state = { failing: false, failSet: new Set<string>(), observer: null as Observer | null, listOptions: null as unknown, availability: {} as Record<string, Availability>, pending: [] as { requestId: string; agentId: string; action: string }[] };
   const client = {
     rpc: async (contract: unknown, input: { agentId: string; mode: Mode }) => {
       if (state.failing) throw new Error("Transport not connected");
-      if (contract === panelStatusRpc) return { modes: { ...modes }, pending: state.pending };
+      if (contract === panelStatusRpc) return { modes: { ...modes }, availability: state.availability, pending: state.pending };
       if (state.failSet.has(input.agentId)) throw new Error("agent closed");
       modes[input.agentId] = input.mode;
       return { mode: input.mode };
@@ -77,6 +77,34 @@ const items = (header: Header) => (header.button.behavior as { items: Item[] }).
 const live = (fake: { headers: Header[] }) => fake.headers.filter((header) => !header.removed);
 
 describe("the workspace header mode button", () => {
+  it("keeps retained mode controls while showing that this open has no computer tools", async () => {
+    const fake = await started({ "agent-1": "auto" }, [slack]);
+    fake.state.availability["agent-1"] = { state: "unavailable", detail: "HTTP computer tools are unsupported." };
+    fake.upsert(slack);
+    await settle();
+    expect(fake.headers[0].updates.at(-1)).toMatchObject({ label: "Computer unavailable", title: expect.stringContaining("Mode: Automatic") });
+    expect(fake.headers[0].updates.at(-1)).not.toHaveProperty("behavior");
+    await items(fake.headers[0])[0].behavior.onPress();
+    expect(fake.modes["agent-1"]).toBe("off");
+  });
+
+  it("shows partial availability separately from a shared retained mode", async () => {
+    const fake = await started({ "agent-1": "ask", "agent-2": "ask" }, [slack, notes]);
+    fake.state.availability["agent-1"] = { state: "available", detail: "Computer tools are available." };
+    fake.state.availability["agent-2"] = { state: "unavailable", detail: "HTTP computer tools are unsupported." };
+    fake.upsert(slack);
+    await settle();
+    expect(fake.headers[0].updates.at(-1)).toMatchObject({ label: "Computer limited", title: expect.stringContaining("1 of 2 chats have computer tools") });
+  });
+
+  it("does not count a provisional tool binding as available", async () => {
+    const fake = await started({ "agent-1": "ask" }, [slack]);
+    fake.state.availability["agent-1"] = { state: "prepared", detail: "Waiting for session installation." };
+    fake.upsert(slack);
+    await settle();
+    expect(fake.headers[0].updates.at(-1)).toMatchObject({ label: "Computer unavailable" });
+  });
+
   it("shows one chat's mode in its workspace header, with the three modes in its menu", async () => {
     const fake = await started({ "agent-1": "ask" }, [slack]);
     expect(live(fake)).toHaveLength(1);

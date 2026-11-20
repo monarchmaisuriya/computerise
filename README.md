@@ -30,11 +30,11 @@ Current release: **v0.7.0**. Computerise follows [Semantic Versioning](https://s
 ## Requirements
 
 - macOS
-- Paseo 0.13.0 or later
+- A Paseo host exposing `adaptiveAgentFeatures` for this source version (release-version alignment is pending)
 - **Accessibility** permission for Paseo
 - **Screen & System Audio Recording** permission for Paseo
 
-After granting Screen Recording, reopen Paseo. New agents receive the computer tools when they are created.
+After granting Screen Recording, reopen Paseo. Computer tools are derived at each eligible interactive session open. Missing HTTP support leaves modes and Stop intact; missing exact approvals leaves ordinary provider permission prompts intact. See [source-verification limits](OVERVIEW.md#source-verification-limits) before installing this unreleased source.
 
 ## Use
 

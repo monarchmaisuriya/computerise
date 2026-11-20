@@ -6,11 +6,13 @@ const SEAT_BYTES = 16;
 
 const seatsSchema = z.record(z.string(), z.string());
 
-// The agent.create hook runs before the agent has an id, so the plugin hands out a seat there and
-// binds it to the agent id in agent.session_open (reason "create"). Tokens name the seat.
+// Tokens name a persistent seat. Adaptive opens reuse it by actual agent id, never by saved env.
 export class Seats {
   private writes: Promise<void> = Promise.resolve();
   private revision = 0;
+  private readonly retained = new Set<string>();
+  private readonly provisional = new Set<string>();
+  private readonly openings = new Map<string, number>();
 
   private constructor(
     private readonly path: string,
@@ -36,6 +38,60 @@ export class Seats {
     return [...new Set(Object.values(this.bindings))];
   }
 
+  ensure(agentId: string): Promise<{ seat: string; allocated: boolean }> {
+    const write = this.writes.then(async () => {
+      const existing = Object.entries(this.bindings).find(([, bound]) => bound === agentId)?.[0];
+      if (existing) {
+        return { seat: existing, allocated: false };
+      }
+      const seat = this.mint();
+      const revision = this.revision;
+      const next = { ...this.bindings, [seat]: agentId };
+      await writeJsonFile(this.path, next);
+      if (revision !== this.revision) throw new Error(`Seat allocation for agent ${agentId} was superseded by revocation`);
+      this.bindings = next;
+      this.provisional.add(seat);
+      return { seat, allocated: true };
+    });
+    this.writes = write.then(() => undefined, () => undefined);
+    return write;
+  }
+
+  retain(seat: string, agentId: string): void {
+    if (this.agentFor(seat) !== agentId) throw new Error(`Seat does not belong to agent ${agentId}`);
+    this.retained.add(seat);
+    this.provisional.delete(seat);
+  }
+
+  holdOpening(seat: string, agentId: string): void {
+    if (this.agentFor(seat) !== agentId) throw new Error(`Seat does not belong to agent ${agentId}`);
+    this.openings.set(seat, (this.openings.get(seat) ?? 0) + 1);
+  }
+
+  async releaseOpening(seat: string, agentId: string, installed: boolean): Promise<void> {
+    const count = this.openings.get(seat) ?? 0;
+    if (count <= 1) this.openings.delete(seat);
+    else this.openings.set(seat, count - 1);
+    if (!installed && this.provisional.has(seat)) await this.revokeProvisional(seat, agentId);
+  }
+
+  revokeProvisional(seat: string, agentId: string): Promise<void> {
+    const write = this.writes.then(async () => {
+      const bound = this.agentFor(seat);
+      if (bound === null) return;
+      if (bound !== agentId) throw new Error(`Provisional seat does not belong to agent ${agentId}`);
+      if (this.retained.has(seat) || !this.provisional.has(seat) || this.openings.has(seat)) return;
+      const next = { ...this.bindings };
+      delete next[seat];
+      this.bindings = next;
+      this.provisional.delete(seat);
+      this.revision += 1;
+      await writeJsonFile(this.path, next);
+    });
+    this.writes = write.catch(() => undefined);
+    return write;
+  }
+
   bind(seat: string, agentId: string): Promise<void> {
     const write = this.writes.then(async () => {
       const bound = this.agentFor(seat);
@@ -51,6 +107,11 @@ export class Seats {
   }
 
   revokeAgent(agentId: string): Promise<void> {
+    for (const [seat, bound] of Object.entries(this.bindings)) if (bound === agentId) {
+      this.retained.delete(seat);
+      this.provisional.delete(seat);
+      this.openings.delete(seat);
+    }
     const next = Object.fromEntries(Object.entries(this.bindings).filter(([, bound]) => bound !== agentId));
     this.bindings = next;
     this.revision += 1;

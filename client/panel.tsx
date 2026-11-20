@@ -57,7 +57,7 @@ export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePan
     <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
       <Text style={styles.title}>Computer</Text>
       <View style={styles.card}>
-        <Text style={styles.heading}>{data.stopped ? "Stopped" : "Ready"}</Text>
+        <Text style={styles.heading}>{data.stopped ? "Stopped" : "Computer controls"}</Text>
         <Text style={styles.muted}>{data.holder ? `Screen lease: ${data.holder}` : "No agent is using the screen"}</Text>
         {!health ? (
           <Text style={styles.muted}>{healthQuery.error ? `Permissions: ${errorText(healthQuery.error)}` : "Checking permissions"}</Text>
@@ -91,10 +91,12 @@ export function ComputerPanel({ theme, layout, workspaceId }: PluginWorkspacePan
         {agentQuery.isPending && <Text style={styles.muted}>Loading agents</Text>}
         {agentQuery.data?.entries.filter(({ agent }) => agent.workspaceId === workspaceId).length === 0 && <Text style={styles.muted}>No agents in this workspace.</Text>}
         {agentQuery.data?.entries.filter(({ agent }) => agent.workspaceId === workspaceId).map(({ agent }) => {
-          if (!Object.hasOwn(data.modes, agent.id)) return <Text key={agent.id} style={styles.muted}>{agent.title ?? agent.id}: no computer tools; agents get them when they are created while Computerise is on</Text>;
+          if (!Object.hasOwn(data.modes, agent.id)) return <Text key={agent.id} style={styles.muted}>{agent.title ?? agent.id}: computer tools have not been prepared for this agent. Availability is checked when its session opens.</Text>;
           const mode = data.modes[agent.id];
+          const availability = data.availability[agent.id];
           return <View key={agent.id} style={{ gap: 6 }}>
-            <Text style={styles.text}>{agent.title ?? agent.id}: {modeLabel(mode)}</Text>
+            <Text style={styles.text}>{agent.title ?? agent.id}: mode {modeLabel(mode)}</Text>
+            <Text style={styles.muted}>{availability?.detail ?? "Tool availability has not been checked on a current open. The saved mode is retained."}</Text>
             <View style={styles.row}>
               {(["off", "ask", "auto"] as const).map((choice) => button(modeLabel(choice), () => change.mutate({ agentId: agent.id, mode: choice }), mode === choice, change.isPending))}
             </View>

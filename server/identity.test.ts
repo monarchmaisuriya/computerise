@@ -46,6 +46,49 @@ describe("bearer tokens", () => {
 });
 
 describe("seats", () => {
+  it("serializes concurrent ensure calls into one persistent seat per actual agent", async () => {
+    const path = join(tempDir("computerise-seats-ensure-"), "seats.json");
+    const seats = await Seats.open(path);
+    const [first, second] = await Promise.all([seats.ensure("agent-x"), seats.ensure("agent-x")]);
+    expect(first.allocated).toBe(true);
+    expect(second).toEqual({ seat: first.seat, allocated: false });
+    expect(seats.agents()).toEqual(["agent-x"]);
+    expect(await (await Seats.open(path)).ensure("agent-x")).toEqual({ seat: first.seat, allocated: false });
+  });
+
+  it("rolls back only the exact newly allocated provisional seat and never another agent's binding", async () => {
+    const seats = await Seats.open(join(tempDir("computerise-seats-rollback-"), "seats.json"));
+    const owner = await seats.ensure("owner");
+    const outsider = await seats.ensure("outsider");
+    await expect(seats.revokeProvisional(owner.seat, "outsider")).rejects.toThrow("does not belong to agent outsider");
+    expect(seats.agentFor(owner.seat)).toBe("owner");
+    await seats.revokeProvisional(outsider.seat, "outsider");
+    expect(seats.agentFor(outsider.seat)).toBeNull();
+    expect(seats.agentFor(owner.seat)).toBe("owner");
+  });
+
+  it("never rolls back a provisional allocation after another opening has retained the same seat", async () => {
+    const seats = await Seats.open(join(tempDir("computerise-seats-retained-"), "seats.json"));
+    const allocation = await seats.ensure("agent-x");
+    seats.retain(allocation.seat, "agent-x");
+    await seats.revokeProvisional(allocation.seat, "agent-x");
+    expect(seats.agentFor(allocation.seat)).toBe("agent-x");
+  });
+
+  it("does not grow across 100 retained refresh and provisional failure cycles", async () => {
+    const path = join(tempDir("computerise-seats-cycles-"), "seats.json");
+    const seats = await Seats.open(path);
+    const retained = await seats.ensure("retained");
+    // Repetition is the bounded lifetime invariant under test, not computed expected output.
+    for (let cycle = 0; cycle < 100; cycle += 1) {
+      expect(await seats.ensure("retained")).toEqual({ seat: retained.seat, allocated: false });
+      const provisional = await seats.ensure("failed");
+      await seats.revokeProvisional(provisional.seat, "failed");
+    }
+    expect(seats.agents()).toEqual(["retained"]);
+    expect((await Seats.open(path)).agents()).toEqual(["retained"]);
+  });
+
   it("binds a seat to one agent, keeps it across reopening, and refuses rebinding it to another agent", async () => {
     const path = join(tempDir("computerise-seats-"), "seats.json");
     const seats = await Seats.open(path);

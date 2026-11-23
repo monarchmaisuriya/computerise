@@ -4,7 +4,7 @@
 
 Computer use for any Paseo agent on macOS. Computerise gives Claude, Codex, OpenCode, and other MCP-capable agents tools to see and control the Mac running the Paseo daemon.
 
-Current release: **v0.7.0**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
+Current release: **v0.8.0**. Computerise follows [Semantic Versioning](https://semver.org/); while the API is pre-1.0, minor releases may intentionally tighten configuration contracts.
 
 ## What it provides
 
@@ -26,6 +26,8 @@ Current release: **v0.7.0**. Computerise follows [Semantic Versioning](https://s
 - Global Stop and Resume controls
 - Accessibility, Screen Recording, and engine health in the Computer panel, with buttons to open the matching System Settings pane, ask macOS for the Accessibility prompt, and check Screen Recording
 - Audit logging that records typed character counts, never typed text
+
+Plugins' helper workers, which run in Paseo's `plugin-data/<plugin>/workers` folders (summaries, memory capture), get no computer tools or note: they never use the screen. Quick Chats and other chats keep them.
 
 ## Requirements
 

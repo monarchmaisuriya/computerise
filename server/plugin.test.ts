@@ -2,7 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { APPROVAL_ROW_KIND, type Settings, settingsSchema } from "../shared/contracts";
 import { SERVER_NAME } from "./mcp";
@@ -81,13 +81,13 @@ describe("computerise server entry", () => {
     cleanup = () => undefined;
   });
 
-  function start(platform: NodeJS.Platform = "darwin", prepare: (root: string) => void = () => undefined) {
+  function start(platform: NodeJS.Platform = "darwin", prepare: (root: string) => void = () => undefined, under?: string) {
     const fake = fakeServer(defaults);
     const mac = fakeEngine();
-    const root = tempDir("computerise-plugin-");
+    const root = under ? join(tempDir("computerise-home-"), under, "computerise") : tempDir("computerise-plugin-");
     prepare(root);
     cleanup = contributeComputer(fake.server, { resolveRoot: async () => root, platform, makeEngine: () => mac.engine }) as () => unknown;
-    return { ...fake, mac };
+    return { ...fake, mac, root };
   }
 
   // Creates an agent the way Paseo does: the create hook, then session_open with the env it set.
@@ -146,6 +146,20 @@ describe("computerise server entry", () => {
     expect(child.config.mcpServers[SERVER_NAME].headers.Authorization).not.toBe(parent.config.mcpServers[SERVER_NAME].headers.Authorization);
     expect(child.config.systemPrompt.split(PROMPT_SECTION_START)).toHaveLength(2);
     expect(child.config.toolPolicy.preapproved.filter((ref: { server: string }) => ref.server === SERVER_NAME)).toHaveLength(TOOLS.length);
+  });
+
+  it("gives no computer tools or note to another plugin's helper workers, but keeps them for M's chats in plugin-data", async () => {
+    const fake = start("darwin", () => undefined, "plugin-data");
+    const pluginData = dirname(fake.root);
+    const helper = await fake.create({ provider: "claude", cwd: join(pluginData, "contextualise", "workers"), systemPrompt: "Summarise.", mcpServers: other });
+    expect(helper.config.systemPrompt).toBe("Summarise.");
+    expect(Object.keys(helper.config.mcpServers)).toEqual(["excalidraw"]);
+    expect(helper.env?.[SEAT_ENV]).toBeUndefined();
+    const own = await fake.create({ provider: "claude", cwd: join(pluginData, "..", "work"), mcpServers: other });
+    expect(Object.keys(own.config.mcpServers).sort()).toEqual(["excalidraw", SERVER_NAME]);
+    // Morphise's Quick Chat keeps M's own chats under plugin-data.
+    const quickChat = await fake.create({ provider: "claude", cwd: join(pluginData, "morphise", "quick-chat", "workspaces", "t-1"), mcpServers: other });
+    expect(Object.keys(quickChat.config.mcpServers).sort()).toEqual(["excalidraw", SERVER_NAME]);
   });
 
   it("adds nothing on other platforms and strips what a parent passed down", async () => {

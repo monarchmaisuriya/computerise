@@ -1,6 +1,6 @@
 import type { Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import type { z } from "zod";
 import { answerApprovalRpc, APPROVAL_ROW_KIND, APPROVAL_TIMEOUT_SECONDS, computerSettings, type healthSchema, panelHealthRpc, panelScreenshotRpc, panelStatusRpc, permissionActionRpc, type Settings, setModeRpc, setStopRpc, statusRpc } from "../shared/contracts";
@@ -87,6 +87,15 @@ export interface ComputerOptions {
   resolveRoot: () => Promise<string>;
   platform?: NodeJS.Platform;
   makeEngine?: (scratchDir: string) => Engine;
+}
+
+// Whether an agent's folder is another plugin's helper folder, `<plugin-data>/<plugin>/workers`, where
+// plugins such as Contextualise and Memorise run their summary helpers. Only `workers`: other plugin-data
+// folders can hold M's own chats (Morphise's Quick Chat). `<plugin-data>` holds this plugin's data root.
+export function isPluginWorkerCwd(root: string, cwd: string): boolean {
+  const pluginData = resolve(dirname(root));
+  const parts = relative(pluginData, resolve(cwd)).split(sep);
+  return basename(pluginData) === "plugin-data" && parts.length >= 2 && parts[0] !== ".." && !isAbsolute(parts[0]) && parts[1] === "workers";
 }
 
 export function contributeComputer(server: PluginServerContext, options: ComputerOptions) {
@@ -198,6 +207,9 @@ export function contributeComputer(server: PluginServerContext, options: Compute
     const env = Object.fromEntries(Object.entries(request.env ?? {}).filter(([name]) => name !== SEAT_ENV));
     const stripped = { ...config, systemPrompt: withoutSection(config.systemPrompt), mcpServers, toolPolicy: { ...config.toolPolicy, preapproved } };
     if (!runtime) return { ...request, env, config: stripped };
+    // Other plugins' helper workers (summaries, memory capture) never use the screen: the tools and their
+    // instructions would only add to every one of their calls.
+    if (isPluginWorkerCwd(await options.resolveRoot(), config.cwd)) return { ...request, env, config: stripped };
     // Computer use is an addition to an agent; failing to prepare it must not block the agent.
     try {
       const { tokens, seats, port } = await runtime;
